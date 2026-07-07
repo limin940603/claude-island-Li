@@ -1,0 +1,16 @@
+# macOS 构建产物
+macos/.build/
+macos/.swiftpm/
+DerivedData/
+*.xcodeproj/xcuserdata/
+
+# 运行时/备份
+*.island-bak-*
+daemon.log
+.daemon.pid
+events.jsonl
+pos.json
+
+# 系统垃圾
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+# 跨平台换行:脚本强制 LF(避免 Windows 上创建的 .sh/.js 带 CRLF 在 mac/linux 上跑崩)
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.mp3 binary
+*.sh text eol=lf
+*.js text eol=lf
+*.swift text eol=lf
