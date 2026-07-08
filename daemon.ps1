@@ -599,10 +599,18 @@ function Wake-Island {
   Slide-To $t
   Log "贴边唤出"
 }
+# 悬停意图判定:细条上停留0.4秒才唤出——防止鼠标扫过浏览器标签栏/屏幕顶边误触
+$script:HoverTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:HoverTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$script:HoverTimer.Add_Tick({
+  $script:HoverTimer.Stop()
+  if ($script:EdgeHidden -and $win.IsMouseOver) { Wake-Island }
+})
 $win.Add_MouseEnter({
-  if ($script:EdgeHidden) { Wake-Island }
+  if ($script:EdgeHidden) { $script:HoverTimer.Stop(); $script:HoverTimer.Start() }
   elseif ($script:Config.edgeHide) { $script:LastWakeAt = [DateTime]::Now }
 })
+$win.Add_MouseLeave({ $script:HoverTimer.Stop() })
 $script:EdgeTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:EdgeTimer.Interval = [TimeSpan]::FromSeconds(1)
 $script:EdgeTimer.Add_Tick({
