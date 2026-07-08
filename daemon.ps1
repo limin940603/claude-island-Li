@@ -3,7 +3,11 @@
 # 核心版:隐藏 STA 窗口 + 圆角 pill + 小熊状态头像 + 状态边框色 + 托盘 + FileSystemWatcher 吃事件 + 音效
 # 用法:powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File daemon.ps1
 # 调试:加 -Debug 参数会把事件处理写日志到 ~/.claude/hooks/claude-island/daemon.log
-param([switch]$DebugLog)
+param(
+  [switch]$DebugLog,
+  [string]$RenderShot,   # 自检:把 pill/面板/控制台离屏渲染成 PNG 到该目录后退出(不截桌面,隐私安全)
+  [switch]$ShowConsole   # 调试:启动即打开设置控制台
+)
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
@@ -20,13 +24,15 @@ New-Item -ItemType Directory -Force $RunDir | Out-Null
 
 function Log($m) { if ($DebugLog) { "$(Get-Date -Format 'HH:mm:ss.fff') $m" | Out-File -Append -Encoding UTF8 $LogFile } }
 
-# ---- 单实例锁 ----
-if (Test-Path $PidFile) {
-  $old = Get-Content $PidFile -ErrorAction SilentlyContinue
-  if ($old -and (Get-Process -Id $old -ErrorAction SilentlyContinue)) { Log "已有实例 $old,退出"; exit 0 }
+# ---- 单实例锁(RenderShot 自检实例不抢锁不写 pid) ----
+if (-not $RenderShot) {
+  if (Test-Path $PidFile) {
+    $old = Get-Content $PidFile -ErrorAction SilentlyContinue
+    if ($old -and (Get-Process -Id $old -ErrorAction SilentlyContinue)) { Log "已有实例 $old,退出"; exit 0 }
+  }
+  $PID | Out-File -Encoding ASCII $PidFile
+  Log "daemon 启动 pid=$PID"
 }
-$PID | Out-File -Encoding ASCII $PidFile
-Log "daemon 启动 pid=$PID"
 
 # ---- 状态色板(语义化,与小熊表情一一对应) ----
 $Colors = @{
@@ -38,9 +44,9 @@ $Colors = @{
 }
 $SoundOf = @{ chime = 'chime.mp3'; notification = 'notification.mp3'; error = 'error.mp3'; pop = 'pop.mp3' }
 
-# ---- 配置(静默/音量/按状态静音;托盘可切换,也可手改 config.json) ----
+# ---- 配置(静默/音量/按状态静音/不透明度/主题/暂停;控制台可视化改,也可手改 config.json) ----
 $ConfigFile = Join-Path $RunDir 'config.json'
-$script:Config = @{ silent = $false; volume = 0.6; muteStates = @() }
+$script:Config = @{ silent = $false; volume = 0.6; muteStates = @(); opacity = 0.94; theme = 'dark'; paused = $false }
 function Load-Config {
   if (Test-Path $ConfigFile) {
     try {
@@ -48,16 +54,89 @@ function Load-Config {
       if ($null -ne $c.silent)     { $script:Config.silent = [bool]$c.silent }
       if ($null -ne $c.volume)     { $script:Config.volume = [double]$c.volume }
       if ($null -ne $c.muteStates) { $script:Config.muteStates = @($c.muteStates) }
+      if ($null -ne $c.opacity)    { $script:Config.opacity = [Math]::Min(1.0, [Math]::Max(0.35, [double]$c.opacity)) }
+      if ($null -ne $c.theme -and "$($c.theme)" -in @('dark','light')) { $script:Config.theme = "$($c.theme)" }
+      if ($null -ne $c.paused)     { $script:Config.paused = [bool]$c.paused }
     } catch {}
   }
 }
 function Save-Config {
   try {
-    $o = [pscustomobject]@{ silent = $script:Config.silent; volume = $script:Config.volume; muteStates = @($script:Config.muteStates) }
+    $o = [pscustomobject]@{
+      silent = $script:Config.silent; volume = $script:Config.volume; muteStates = @($script:Config.muteStates)
+      opacity = $script:Config.opacity; theme = $script:Config.theme; paused = $script:Config.paused
+    }
     [System.IO.File]::WriteAllText($ConfigFile, ($o | ConvertTo-Json), (New-Object System.Text.UTF8Encoding $false))
   } catch {}
 }
 Load-Config
+
+# ---- 每日事件计数归档(events.jsonl 只留40条环形,趋势靠这份;只留14天) ----
+# 结构:{ lastTs: <已计数水位>, days: { 'yyyy-MM-dd': {done,error,authorize,waiting} } }
+# lastTs 防重复:daemon 重启会重读整个环形缓冲,只有 ts > lastTs 的事件才计数
+$StatsFile = Join-Path $RunDir 'stats.json'
+function Update-Stats($events) {
+  try {
+    $days = @{}; $lastTs = [double]0
+    if (Test-Path $StatsFile) {
+      $j = Get-Content $StatsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+      if ($null -ne $j.lastTs) { $lastTs = [double]$j.lastTs }
+      if ($null -ne $j.days) {
+        foreach ($p in $j.days.PSObject.Properties) {
+          $days[$p.Name] = @{ done = [int]$p.Value.done; error = [int]$p.Value.error; authorize = [int]$p.Value.authorize; waiting = [int]$p.Value.waiting }
+        }
+      }
+    }
+    $touched = $false
+    foreach ($e in $events) {
+      if ([double]$e.ts -le $lastTs) { continue }
+      $st = "$($e.state)"
+      if ($st -notin @('done','error','authorize','waiting')) { continue }
+      $day = ([DateTimeOffset]::FromUnixTimeMilliseconds([long]$e.ts)).ToLocalTime().ToString('yyyy-MM-dd')
+      if (-not $days.ContainsKey($day)) { $days[$day] = @{ done = 0; error = 0; authorize = 0; waiting = 0 } }
+      $days[$day][$st]++; $touched = $true
+    }
+    $newMax = ($events | Measure-Object -Property ts -Maximum).Maximum
+    if ($newMax -gt $lastTs) { $lastTs = [double]$newMax } elseif (-not $touched) { return }
+    $keep = @($days.Keys | Sort-Object -Descending | Select-Object -First 14 | Sort-Object)
+    $outDays = [ordered]@{}; foreach ($k in $keep) { $outDays[$k] = $days[$k] }
+    $out = [pscustomobject]@{ lastTs = $lastTs; days = $outDays }
+    [System.IO.File]::WriteAllText($StatsFile, ($out | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding $false))
+  } catch { Log "stats 写入失败 $_" }
+}
+function Read-Stats {
+  $r = @{}
+  try {
+    if (Test-Path $StatsFile) {
+      $j = Get-Content $StatsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+      if ($null -ne $j.days) {
+        foreach ($p in $j.days.PSObject.Properties) {
+          $r[$p.Name] = @{ done = [int]$p.Value.done; error = [int]$p.Value.error; authorize = [int]$p.Value.authorize; waiting = [int]$p.Value.waiting }
+        }
+      }
+    }
+  } catch {}
+  return $r
+}
+
+# ---- 开机自启(与 install.ps1 同一快捷方式) ----
+$StartupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'ClaudeIsland.lnk'
+$DaemonPath = $MyInvocation.MyCommand.Path
+function Test-AutoStart { return (Test-Path $StartupLnk) }
+function Set-AutoStart($on) {
+  try {
+    if ($on) {
+      $ws = New-Object -ComObject WScript.Shell
+      $sc = $ws.CreateShortcut($StartupLnk)
+      $sc.TargetPath = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+      $sc.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File `"$DaemonPath`""
+      $sc.WorkingDirectory = Split-Path -Parent $DaemonPath
+      $sc.Save()
+    } else {
+      Remove-Item $StartupLnk -Force -ErrorAction SilentlyContinue
+    }
+  } catch { Log "自启切换失败 $_" }
+}
 
 # ---- XAML(折叠态 pill:小熊 + 状态边框 + 标题) ----
 [xml]$xaml = @"
@@ -68,10 +147,10 @@ Load-Config
         WindowStartupLocation="Manual" ResizeMode="NoResize">
   <StackPanel x:Name="Root" TextElement.FontFamily="Microsoft YaHei UI">
     <!-- 折叠态胶囊 -->
-    <Border x:Name="Pill" CornerRadius="26" Background="#F0161310" Padding="8,6,18,6" Margin="22,22,22,0"
+    <Border x:Name="Pill" CornerRadius="26" Background="#F0161310" Padding="8,6,18,6" Margin="24,24,24,24"
             BorderThickness="1" BorderBrush="#26FFFFFF" TextElement.FontFamily="Microsoft YaHei UI"
             HorizontalAlignment="Center">
-      <Border.Effect><DropShadowEffect BlurRadius="28" ShadowDepth="7" Opacity="0.5" Color="#000000"/></Border.Effect>
+      <Border.Effect><DropShadowEffect BlurRadius="18" ShadowDepth="2" Direction="270" Opacity="0.35" Color="#000000"/></Border.Effect>
       <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
         <Grid Width="58" Height="58">
           <Ellipse Width="48" Height="48" Fill="#FCFAF7"/>
@@ -103,23 +182,23 @@ Load-Config
       </StackPanel>
     </Border>
     <!-- 展开态面板 -->
-    <Border x:Name="Panel" Width="322" Margin="22,9,22,22" CornerRadius="20" Background="#F0161310"
+    <Border x:Name="Panel" Width="322" Margin="24,0,24,24" CornerRadius="20" Background="#F0161310"
             BorderThickness="1" BorderBrush="#26FFFFFF" HorizontalAlignment="Center" Visibility="Collapsed">
-      <Border.Effect><DropShadowEffect BlurRadius="30" ShadowDepth="9" Opacity="0.55" Color="#000000"/></Border.Effect>
+      <Border.Effect><DropShadowEffect BlurRadius="20" ShadowDepth="3" Direction="270" Opacity="0.38" Color="#000000"/></Border.Effect>
       <StackPanel>
         <Grid Margin="16,13,12,11">
           <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-            <TextBlock Text="灵动岛" Foreground="#F6F1EA" FontSize="13.5" FontWeight="Bold"/>
-            <Border Background="#1AFFFFFF" CornerRadius="9" Padding="8,2" Margin="10,0,0,0" VerticalAlignment="Center">
+            <TextBlock x:Name="PanelTitle" Text="灵动岛" Foreground="#F6F1EA" FontSize="13.5" FontWeight="Bold"/>
+            <Border x:Name="UnreadWrap" Background="#1AFFFFFF" CornerRadius="9" Padding="8,2" Margin="10,0,0,0" VerticalAlignment="Center">
               <TextBlock x:Name="PanelUnread" Text="0 条未读" Foreground="#B4A99D" FontSize="11"/>
             </Border>
           </StackPanel>
           <TextBlock x:Name="ClearBtn" Text="清空" Foreground="#8A8178" FontSize="12"
                      HorizontalAlignment="Right" VerticalAlignment="Center" Cursor="Hand"/>
         </Grid>
-        <Border Height="1" Background="#12FFFFFF"/>
+        <Border x:Name="Sep1" Height="1" Background="#12FFFFFF"/>
         <StackPanel x:Name="MsgList" Margin="7,6"/>
-        <Border Height="1" Background="#12FFFFFF"/>
+        <Border x:Name="Sep2" Height="1" Background="#12FFFFFF"/>
         <TextBlock x:Name="ReadAllBtn" Text="全部已读" Foreground="#CFC6BB" FontSize="12.5"
                    Margin="16,11" Cursor="Hand"/>
       </StackPanel>
@@ -130,6 +209,7 @@ Load-Config
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $win    = [Windows.Markup.XamlReader]::Load($reader)
+$RootPanel = $win.FindName('Root')   # 注意:$Root 已被脚本目录占用,勿混用
 $Pill   = $win.FindName('Pill')
 $BearBrush = $win.FindName('BearBrush')
 $Title  = $win.FindName('Title')
@@ -145,6 +225,60 @@ $MsgList    = $win.FindName('MsgList')
 $PanelUnread= $win.FindName('PanelUnread')
 $ClearBtn   = $win.FindName('ClearBtn')
 $ReadAllBtn = $win.FindName('ReadAllBtn')
+$PanelTitle = $win.FindName('PanelTitle')
+$UnreadWrap = $win.FindName('UnreadWrap')
+$Sep1       = $win.FindName('Sep1')
+$Sep2       = $win.FindName('Sep2')
+
+# ---- 主题+不透明度:实时作用于 pill/面板(状态色环/徽章/光晕语义两套主题一致) ----
+$script:BC = New-Object System.Windows.Media.BrushConverter
+function Apply-Style {
+  $alpha = [byte][Math]::Round(255 * [double]$script:Config.opacity)
+  $hexA = $alpha.ToString('X2')
+  if ($script:Config.theme -eq 'light') {
+    $bg = $script:BC.ConvertFromString("#${hexA}FCFAF7")
+    $Pill.Background = $bg;                 $Panel.Background = $bg
+    $Pill.BorderBrush = $script:BC.ConvertFromString('#24171717')
+    $Panel.BorderBrush = $Pill.BorderBrush
+    $Title.Foreground = $script:BC.ConvertFromString('#2A241E')
+    $Sub.Foreground   = $script:BC.ConvertFromString('#8A8178')
+    $PanelTitle.Foreground = $Title.Foreground
+    $PanelUnread.Foreground = $Sub.Foreground
+    $UnreadWrap.Background = $script:BC.ConvertFromString('#12171717')
+    $ClearBtn.Foreground = $Sub.Foreground
+    $ReadAllBtn.Foreground = $script:BC.ConvertFromString('#5C544A')
+    $Sep1.Background = $script:BC.ConvertFromString('#14171717'); $Sep2.Background = $Sep1.Background
+    $script:RowTitleFg = '#2A241E'; $script:RowMetaFg = '#8A8178'
+  } else {
+    $bg = $script:BC.ConvertFromString("#${hexA}161310")
+    $Pill.Background = $bg;                 $Panel.Background = $bg
+    $Pill.BorderBrush = $script:BC.ConvertFromString('#26FFFFFF')
+    $Panel.BorderBrush = $Pill.BorderBrush
+    $Title.Foreground = $script:BC.ConvertFromString('#F6F1EA')
+    $Sub.Foreground   = $script:BC.ConvertFromString('#B4A99D')
+    $PanelTitle.Foreground = $Title.Foreground
+    $PanelUnread.Foreground = $Sub.Foreground
+    $UnreadWrap.Background = $script:BC.ConvertFromString('#1AFFFFFF')
+    $ClearBtn.Foreground = $script:BC.ConvertFromString('#8A8178')
+    $ReadAllBtn.Foreground = $script:BC.ConvertFromString('#CFC6BB')
+    $Sep1.Background = $script:BC.ConvertFromString('#12FFFFFF'); $Sep2.Background = $Sep1.Background
+    $script:RowTitleFg = '#F6F1EA'; $script:RowMetaFg = '#B4A99D'
+  }
+}
+
+# ---- 离屏渲染自检:把控件渲染成 PNG(不截桌面,隐私安全) ----
+function Save-Shot($element, $path) {
+  try {
+    $element.UpdateLayout()
+    $w = [int][Math]::Ceiling($element.ActualWidth); $h = [int][Math]::Ceiling($element.ActualHeight)
+    if ($w -le 0 -or $h -le 0) { Log "Save-Shot 尺寸为0: $path"; return }
+    $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($w, $h, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $rtb.Render($element)
+    $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+    $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($rtb))
+    $fs = [System.IO.File]::OpenWrite($path); $enc.Save($fs); $fs.Close()
+  } catch { Log "Save-Shot 失败 $_" }
+}
 
 # ---- 位置:顶部居中(或读 pos.json) ----
 $win.Add_SourceInitialized({
@@ -270,8 +404,8 @@ function Build-Row($e) {
       <Ellipse Width="34" Height="34" Stroke="$col" StrokeThickness="1.6"/>
     </Grid>
     <StackPanel VerticalAlignment="Center">
-      <TextBlock Text="$title" Foreground="#F6F1EA" FontSize="13.5" FontWeight="SemiBold"/>
-      <TextBlock Text="$meta" Foreground="#B4A99D" FontSize="11.5" Margin="0,2,0,0"/>
+      <TextBlock Text="$title" Foreground="$($script:RowTitleFg)" FontSize="13.5" FontWeight="SemiBold"/>
+      <TextBlock Text="$meta" Foreground="$($script:RowMetaFg)" FontSize="11.5" Margin="0,2,0,0"/>
     </StackPanel>
   </StackPanel>
 </Border>
@@ -337,6 +471,8 @@ function Handle-EventsFile {
   if ($new.Count -eq 0) { return }
   $script:LastTs = ($new | Measure-Object -Property ts -Maximum).Maximum
   Load-Config                                # 有新事件才读配置(静默/静音状态)
+  Update-Stats $new                          # 统计计事实事件量(静音/暂停也照记)
+  if ($script:Config.paused) { return }      # 已暂停:daemon 保活只记录,不弹不响不计数
   $visible = @($new | Where-Object { $script:Config.muteStates -notcontains "$($_.state)" })
   if ($visible.Count -eq 0) { return }       # 该状态被静音则整条忽略(不弹不响不计数)
   Set-Badge ($script:Unread + $visible.Count)
@@ -349,30 +485,428 @@ $timer.Interval = [TimeSpan]::FromMilliseconds(400)
 $timer.Add_Tick({ Handle-EventsFile })
 $timer.Start()
 
-# ---- 托盘 ----
-$tray = New-Object System.Windows.Forms.NotifyIcon
-$icoPath = Join-Path $Assets 'bear-idle.png'
-try {
-  if (Test-Path $icoPath) {
-    $bm = New-Object System.Drawing.Bitmap $icoPath
-    $tray.Icon = [System.Drawing.Icon]::FromHandle($bm.GetHicon())
-  } else { $tray.Icon = [System.Drawing.SystemIcons]::Application }
-} catch { $tray.Icon = [System.Drawing.SystemIcons]::Application }
-$tray.Text = 'Claude 灵动岛'; $tray.Visible = $true
-$menu = New-Object System.Windows.Forms.ContextMenuStrip
-$miSilent = New-Object System.Windows.Forms.ToolStripMenuItem
-$miSilent.Text = '静默(只弹不响)'; $miSilent.CheckOnClick = $true; $miSilent.Checked = $script:Config.silent
-$miSilent.Add_Click({ $script:Config.silent = $miSilent.Checked; Save-Config; Log "静默=$($miSilent.Checked)" })
-[void]$menu.Items.Add($miSilent)
-$miConfig = New-Object System.Windows.Forms.ToolStripMenuItem
-$miConfig.Text = '打开配置文件…'
-$miConfig.Add_Click({ Save-Config; Start-Process notepad.exe $ConfigFile })
-[void]$menu.Items.Add($miConfig)
-[void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-$miQuit = New-Object System.Windows.Forms.ToolStripMenuItem
-$miQuit.Text = '退出'; $miQuit.Add_Click({ $win.Dispatcher.Invoke([action]{ $win.Close() }) })
-[void]$menu.Items.Add($miQuit)
-$tray.ContextMenuStrip = $menu
+# ---- 设置控制台(按已批准概念稿 v0.2 移植;真岛就在屏上,改动即所见) ----
+$script:CWin = $null
+$script:CW = @{}
+$script:CWSyncing = $false
+
+function Sync-Switch($sw, $on) {
+  $knob = $sw.Child
+  if ($on) { $sw.Background = $script:BC.ConvertFromString('#E26934'); $knob.HorizontalAlignment = 'Right'; $knob.Margin = '0,0,3,0' }
+  else     { $sw.Background = $script:BC.ConvertFromString('#E4DCCF'); $knob.HorizontalAlignment = 'Left';  $knob.Margin = '3,0,0,0' }
+}
+function Toggle-Mute($state, $sw) {
+  $m = @($script:Config.muteStates)
+  if ($m -contains $state) { $m = @($m | Where-Object { $_ -ne $state }) } else { $m += $state }
+  $script:Config.muteStates = $m; Save-Config
+  Sync-Switch $sw ($m -contains $state)
+}
+function Sync-Seg {
+  $dark = ($script:Config.theme -eq 'dark')
+  $script:CW.SegDark.Background  = if ($dark) { $script:BC.ConvertFromString('#FFFFFF') } else { $script:BC.ConvertFromString('#00FFFFFF') }
+  $script:CW.SegDarkTx.Foreground  = if ($dark) { $script:BC.ConvertFromString('#2A241E') } else { $script:BC.ConvertFromString('#8A8178') }
+  $script:CW.SegLight.Background = if ($dark) { $script:BC.ConvertFromString('#00FFFFFF') } else { $script:BC.ConvertFromString('#FFFFFF') }
+  $script:CW.SegLightTx.Foreground = if ($dark) { $script:BC.ConvertFromString('#8A8178') } else { $script:BC.ConvertFromString('#2A241E') }
+}
+function Sync-Master {
+  if ($script:Config.paused) {
+    $script:CW.CMasterLabel.Text = '已暂停'; $script:CW.CMasterLabel.Foreground = $script:BC.ConvertFromString('#8A8178')
+  } else {
+    $script:CW.CMasterLabel.Text = '已开启'; $script:CW.CMasterLabel.Foreground = $script:BC.ConvertFromString('#2FA84F')
+  }
+  Sync-Switch $script:CW.SwMaster (-not $script:Config.paused)
+}
+function Paint-Trend {
+  $cv = $script:CW.TrendCanvas; if (-not $cv) { return }
+  $cv.Children.Clear()
+  $stats = Read-Stats
+  $days = @(); for ($i = 6; $i -ge 0; $i--) { $days += (Get-Date).AddDays(-$i).ToString('yyyy-MM-dd') }
+  $totals = @()
+  foreach ($d in $days) {
+    if ($stats.ContainsKey($d)) { $s = $stats[$d]; $totals += [int]($s.done + $s.error + $s.authorize + $s.waiting) }
+    else { $totals += 0 }
+  }
+  $max = ($totals | Measure-Object -Maximum).Maximum; if ($max -lt 1) { $max = 1 }
+  $H = 52.0; $x0 = 10.0; $x1 = 276.0
+  $pts = New-Object System.Windows.Media.PointCollection
+  for ($i = 0; $i -lt 7; $i++) {
+    $x = $x0 + ($x1 - $x0) * $i / 6.0
+    $y = 6.0 + ($H - 12.0) * (1.0 - $totals[$i] / $max)
+    $pts.Add((New-Object System.Windows.Point($x, $y)))
+  }
+  $ppts = New-Object System.Windows.Media.PointCollection
+  foreach ($p in $pts) { $ppts.Add($p) }
+  $ppts.Add((New-Object System.Windows.Point($x1, $H))); $ppts.Add((New-Object System.Windows.Point($x0, $H)))
+  $poly = New-Object System.Windows.Shapes.Polygon
+  $poly.Points = $ppts; $poly.Fill = $script:BC.ConvertFromString('#2EE26934')
+  [void]$cv.Children.Add($poly)
+  $line = New-Object System.Windows.Shapes.Polyline
+  $line.Points = $pts; $line.Stroke = $script:BC.ConvertFromString('#E26934'); $line.StrokeThickness = 2; $line.StrokeLineJoin = 'Round'
+  [void]$cv.Children.Add($line)
+  for ($i = 0; $i -lt 7; $i++) {
+    $dot = New-Object System.Windows.Shapes.Ellipse; $dot.Width = 5; $dot.Height = 5; $dot.Fill = $line.Stroke
+    [System.Windows.Controls.Canvas]::SetLeft($dot, $pts[$i].X - 2.5); [System.Windows.Controls.Canvas]::SetTop($dot, $pts[$i].Y - 2.5)
+    [void]$cv.Children.Add($dot)
+    $tb = New-Object System.Windows.Controls.TextBlock
+    if ($i -eq 6) { $tb.Text = '今天' } else { $tb.Text = ([DateTime]::ParseExact($days[$i], 'yyyy-MM-dd', $null)).ToString('M/d') }
+    $tb.FontSize = 9; $tb.Foreground = $script:BC.ConvertFromString('#A89F95')
+    [System.Windows.Controls.Canvas]::SetLeft($tb, $pts[$i].X - 10); [System.Windows.Controls.Canvas]::SetTop($tb, $H + 6.0)
+    [void]$cv.Children.Add($tb)
+  }
+}
+function Sync-ConsoleUI {
+  if (-not $script:CWin) { return }
+  $script:CWSyncing = $true
+  try {
+    Sync-Master
+    Sync-Switch $script:CW.SwAuto (Test-AutoStart)
+    Sync-Switch $script:CW.SwSilent ([bool]$script:Config.silent)
+    $script:CW.VolSlider.Value = [Math]::Round(100 * [double]$script:Config.volume)
+    $script:CW.VolVal.Text = "$([int]$script:CW.VolSlider.Value)%"
+    $script:CW.AlphaSlider.Value = [Math]::Round(100 * [double]$script:Config.opacity)
+    $script:CW.AlphaVal.Text = "$([int]$script:CW.AlphaSlider.Value)%"
+    Sync-Seg
+    $m = @($script:Config.muteStates)
+    Sync-Switch $script:CW.SwMuteDone ($m -contains 'done')
+    Sync-Switch $script:CW.SwMuteAuth ($m -contains 'authorize')
+    Sync-Switch $script:CW.SwMuteErr  ($m -contains 'error')
+    Sync-Switch $script:CW.SwMuteWait ($m -contains 'waiting')
+    Sync-Switch $script:CW.SwMuteIdle ($m -contains 'idle')
+    $today = (Get-Date).ToString('yyyy-MM-dd'); $stats = Read-Stats
+    if ($stats.ContainsKey($today)) { $t = $stats[$today] } else { $t = @{ done = 0; error = 0; authorize = 0; waiting = 0 } }
+    $script:CW.SnDone.Text = "$($t.done)"; $script:CW.SnErr.Text = "$($t.error)"
+    $script:CW.SnAuth.Text = "$($t.authorize)"; $script:CW.SnWait.Text = "$($t.waiting)"
+    Paint-Trend
+  } finally { $script:CWSyncing = $false }
+}
+function Show-Console {
+  if ($script:CWin) { try { $script:CWin.Activate(); Sync-ConsoleUI; return } catch { $script:CWin = $null } }
+  $bDone = BearUri 'done'; $bAuth = BearUri 'authorize'; $bErr = BearUri 'error'; $bWait = BearUri 'waiting'; $bIdle = BearUri 'idle'
+  [xml]$cxaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Claude 灵动岛 · 控制台" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        SizeToContent="Height" Width="748" WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
+        ShowInTaskbar="True" TextElement.FontFamily="Microsoft YaHei UI">
+  <Border Margin="14" CornerRadius="14" Background="#F9F6F1">
+    <Border.Effect><DropShadowEffect BlurRadius="22" ShadowDepth="4" Direction="270" Opacity="0.30" Color="#000000"/></Border.Effect>
+    <StackPanel>
+      <Border x:Name="CTitleBar" Background="#FDFBF8" CornerRadius="14,14,0,0" Height="40" Padding="14,0,6,0">
+        <Grid>
+          <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+            <Ellipse Width="22" Height="22"><Ellipse.Fill><ImageBrush ImageSource="$bIdle" Stretch="UniformToFill"/></Ellipse.Fill></Ellipse>
+            <TextBlock Text="Claude 灵动岛 · 控制台" FontSize="12.5" FontWeight="SemiBold" Foreground="#6F665D" Margin="9,0,0,0" VerticalAlignment="Center"/>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+            <Border x:Name="CMin" Width="36" Height="28" CornerRadius="7" Background="#00000000" Cursor="Hand">
+              <TextBlock Text="─" FontSize="12" Foreground="#9B9187" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <Border x:Name="CClose" Width="36" Height="28" CornerRadius="7" Background="#00000000" Cursor="Hand">
+              <TextBlock Text="✕" FontSize="12" Foreground="#9B9187" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+          </StackPanel>
+        </Grid>
+      </Border>
+      <StackPanel Margin="20,16,20,0">
+        <Border Background="#FFFFFF" BorderThickness="1" BorderBrush="#ECE6DB" CornerRadius="16" Padding="16,14">
+          <Grid>
+            <StackPanel Orientation="Horizontal">
+              <Grid Width="52" Height="52">
+                <Ellipse Fill="#FCFAF7"/>
+                <Ellipse RenderOptions.BitmapScalingMode="HighQuality">
+                  <Ellipse.Fill><ImageBrush ImageSource="$bDone" Stretch="UniformToFill"/></Ellipse.Fill>
+                </Ellipse>
+                <Ellipse Stroke="#E26934" StrokeThickness="2.5"/>
+              </Grid>
+              <StackPanel Margin="13,0,0,0" VerticalAlignment="Center">
+                <TextBlock Text="Claude 灵动岛" FontSize="16" FontWeight="Bold" Foreground="#2A241E"/>
+                <TextBlock Text="桌面通知器 · Windows 版 · daemon 运行中" FontSize="11.5" Foreground="#8A8178" Margin="0,3,0,0"/>
+              </StackPanel>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+              <TextBlock x:Name="CMasterLabel" Text="已开启" FontSize="13" FontWeight="SemiBold" Foreground="#2FA84F" VerticalAlignment="Center" Margin="0,0,10,0"/>
+              <Border x:Name="SwMaster" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" VerticalAlignment="Center">
+                <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+              </Border>
+            </StackPanel>
+          </Grid>
+        </Border>
+        <Grid Margin="0,16,0,0">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="1.08*"/><ColumnDefinition Width="16"/><ColumnDefinition Width="0.92*"/>
+          </Grid.ColumnDefinitions>
+          <Border Grid.Column="0" Background="#FFFFFF" BorderThickness="1" BorderBrush="#ECE6DB" CornerRadius="16" Padding="17,14" VerticalAlignment="Top">
+            <StackPanel>
+              <TextBlock Text="常规设置" FontSize="13" FontWeight="Bold" Foreground="#2A241E"/>
+              <TextBlock Text="改动即时生效并写入 config.json" FontSize="11" Foreground="#8A8178" Margin="0,3,0,6"/>
+              <Grid Margin="0,10,0,10">
+                <StackPanel Margin="0,0,56,0">
+                  <TextBlock Text="开机自启动" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
+                  <TextBlock Text="跟随 Windows 登录启动灵动岛" FontSize="11" Foreground="#8A8178" Margin="0,2,0,0"/>
+                </StackPanel>
+                <Border x:Name="SwAuto" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" HorizontalAlignment="Right" VerticalAlignment="Center">
+                  <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                </Border>
+              </Grid>
+              <Border Height="1" Background="#F0EAE0"/>
+              <Grid Margin="0,10,0,10">
+                <StackPanel Margin="0,0,56,0">
+                  <TextBlock Text="静默模式" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
+                  <TextBlock Text="只弹岛不响铃" FontSize="11" Foreground="#8A8178" Margin="0,2,0,0"/>
+                </StackPanel>
+                <Border x:Name="SwSilent" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" HorizontalAlignment="Right" VerticalAlignment="Center">
+                  <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                </Border>
+              </Grid>
+              <Border Height="1" Background="#F0EAE0"/>
+              <StackPanel Margin="0,10,0,10">
+                <TextBlock Text="提示音量" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
+                <Grid Margin="0,7,0,0">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="46"/></Grid.ColumnDefinitions>
+                  <Slider x:Name="VolSlider" Minimum="0" Maximum="100" Value="60" VerticalAlignment="Center" IsMoveToPointEnabled="True"/>
+                  <TextBlock x:Name="VolVal" Grid.Column="1" Text="60%" FontSize="12" FontWeight="Bold" Foreground="#E26934" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                </Grid>
+              </StackPanel>
+              <Border Height="1" Background="#F0EAE0"/>
+              <StackPanel Margin="0,10,0,10">
+                <TextBlock Text="岛体不透明度" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
+                <Grid Margin="0,7,0,0">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="46"/></Grid.ColumnDefinitions>
+                  <Slider x:Name="AlphaSlider" Minimum="35" Maximum="100" Value="94" VerticalAlignment="Center" IsMoveToPointEnabled="True"/>
+                  <TextBlock x:Name="AlphaVal" Grid.Column="1" Text="94%" FontSize="12" FontWeight="Bold" Foreground="#E26934" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                </Grid>
+              </StackPanel>
+              <Border Height="1" Background="#F0EAE0"/>
+              <Grid Margin="0,10,0,4">
+                <StackPanel Margin="0,0,120,0">
+                  <TextBlock Text="岛体主题" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
+                  <TextBlock Text="改动直接作用于屏上真岛" FontSize="11" Foreground="#8A8178" Margin="0,2,0,0"/>
+                </StackPanel>
+                <Border Background="#EFE9DE" CornerRadius="10" Padding="3" HorizontalAlignment="Right" VerticalAlignment="Center">
+                  <StackPanel Orientation="Horizontal">
+                    <Border x:Name="SegDark" CornerRadius="8" Padding="14,5" Background="#FFFFFF" Cursor="Hand">
+                      <TextBlock x:Name="SegDarkTx" Text="暗色" FontSize="12" FontWeight="SemiBold" Foreground="#2A241E"/>
+                    </Border>
+                    <Border x:Name="SegLight" CornerRadius="8" Padding="14,5" Background="#00FFFFFF" Cursor="Hand">
+                      <TextBlock x:Name="SegLightTx" Text="亮色" FontSize="12" FontWeight="SemiBold" Foreground="#8A8178"/>
+                    </Border>
+                  </StackPanel>
+                </Border>
+              </Grid>
+            </StackPanel>
+          </Border>
+          <StackPanel Grid.Column="2">
+            <Border Background="#FFFFFF" BorderThickness="1" BorderBrush="#ECE6DB" CornerRadius="16" Padding="17,14">
+              <StackPanel>
+                <TextBlock Text="按状态静音" FontSize="13" FontWeight="Bold" Foreground="#2A241E"/>
+                <TextBlock Text="被静音的状态只更新面板,不弹岛不出声" FontSize="11" Foreground="#8A8178" Margin="0,3,0,4"/>
+                <Grid Margin="0,7,0,7">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                  <Grid Width="32" Height="32"><Ellipse Fill="#FCFAF7"/><Ellipse><Ellipse.Fill><ImageBrush ImageSource="$bDone" Stretch="UniformToFill"/></Ellipse.Fill></Ellipse><Ellipse Stroke="#2FA84F" StrokeThickness="1.6"/></Grid>
+                  <StackPanel Grid.Column="1" Margin="10,0,8,0" VerticalAlignment="Center">
+                    <TextBlock Text="任务完成" FontSize="12.5" FontWeight="SemiBold" Foreground="#2A241E"/>
+                    <TextBlock Text="Stop / SubagentStop" FontSize="10" Foreground="#8A8178"/>
+                  </StackPanel>
+                  <Ellipse Grid.Column="2" Width="8" Height="8" Fill="#2FA84F" VerticalAlignment="Center" Margin="0,0,9,0"/>
+                  <Border Grid.Column="3" x:Name="SwMuteDone" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" VerticalAlignment="Center">
+                    <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                  </Border>
+                </Grid>
+                <Border Height="1" Background="#F0EAE0"/>
+                <Grid Margin="0,7,0,7">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                  <Grid Width="32" Height="32"><Ellipse Fill="#FCFAF7"/><Ellipse><Ellipse.Fill><ImageBrush ImageSource="$bAuth" Stretch="UniformToFill"/></Ellipse.Fill></Ellipse><Ellipse Stroke="#2B7FD4" StrokeThickness="1.6"/></Grid>
+                  <StackPanel Grid.Column="1" Margin="10,0,8,0" VerticalAlignment="Center">
+                    <TextBlock Text="需要授权" FontSize="12.5" FontWeight="SemiBold" Foreground="#2A241E"/>
+                    <TextBlock Text="PermissionRequest" FontSize="10" Foreground="#8A8178"/>
+                  </StackPanel>
+                  <Ellipse Grid.Column="2" Width="8" Height="8" Fill="#2B7FD4" VerticalAlignment="Center" Margin="0,0,9,0"/>
+                  <Border Grid.Column="3" x:Name="SwMuteAuth" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" VerticalAlignment="Center">
+                    <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                  </Border>
+                </Grid>
+                <Border Height="1" Background="#F0EAE0"/>
+                <Grid Margin="0,7,0,7">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                  <Grid Width="32" Height="32"><Ellipse Fill="#FCFAF7"/><Ellipse><Ellipse.Fill><ImageBrush ImageSource="$bErr" Stretch="UniformToFill"/></Ellipse.Fill></Ellipse><Ellipse Stroke="#D64545" StrokeThickness="1.6"/></Grid>
+                  <StackPanel Grid.Column="1" Margin="10,0,8,0" VerticalAlignment="Center">
+                    <TextBlock Text="出错了" FontSize="12.5" FontWeight="SemiBold" Foreground="#2A241E"/>
+                    <TextBlock Text="PostToolUseFailure" FontSize="10" Foreground="#8A8178"/>
+                  </StackPanel>
+                  <Ellipse Grid.Column="2" Width="8" Height="8" Fill="#D64545" VerticalAlignment="Center" Margin="0,0,9,0"/>
+                  <Border Grid.Column="3" x:Name="SwMuteErr" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" VerticalAlignment="Center">
+                    <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                  </Border>
+                </Grid>
+                <Border Height="1" Background="#F0EAE0"/>
+                <Grid Margin="0,7,0,7">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                  <Grid Width="32" Height="32"><Ellipse Fill="#FCFAF7"/><Ellipse><Ellipse.Fill><ImageBrush ImageSource="$bWait" Stretch="UniformToFill"/></Ellipse.Fill></Ellipse><Ellipse Stroke="#E8A24A" StrokeThickness="1.6"/></Grid>
+                  <StackPanel Grid.Column="1" Margin="10,0,8,0" VerticalAlignment="Center">
+                    <TextBlock Text="等你回话" FontSize="12.5" FontWeight="SemiBold" Foreground="#2A241E"/>
+                    <TextBlock Text="Notification · idle" FontSize="10" Foreground="#8A8178"/>
+                  </StackPanel>
+                  <Ellipse Grid.Column="2" Width="8" Height="8" Fill="#E8A24A" VerticalAlignment="Center" Margin="0,0,9,0"/>
+                  <Border Grid.Column="3" x:Name="SwMuteWait" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" VerticalAlignment="Center">
+                    <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                  </Border>
+                </Grid>
+                <Border Height="1" Background="#F0EAE0"/>
+                <Grid Margin="0,7,0,0">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                  <Grid Width="32" Height="32"><Ellipse Fill="#FCFAF7"/><Ellipse><Ellipse.Fill><ImageBrush ImageSource="$bIdle" Stretch="UniformToFill"/></Ellipse.Fill></Ellipse><Ellipse Stroke="#A89F95" StrokeThickness="1.6"/></Grid>
+                  <StackPanel Grid.Column="1" Margin="10,0,8,0" VerticalAlignment="Center">
+                    <TextBlock Text="空闲" FontSize="12.5" FontWeight="SemiBold" Foreground="#2A241E"/>
+                    <TextBlock Text="就绪回落态" FontSize="10" Foreground="#8A8178"/>
+                  </StackPanel>
+                  <Ellipse Grid.Column="2" Width="8" Height="8" Fill="#A89F95" VerticalAlignment="Center" Margin="0,0,9,0"/>
+                  <Border Grid.Column="3" x:Name="SwMuteIdle" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" VerticalAlignment="Center">
+                    <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                  </Border>
+                </Grid>
+              </StackPanel>
+            </Border>
+            <Border Background="#FFFFFF" BorderThickness="1" BorderBrush="#ECE6DB" CornerRadius="16" Padding="17,14" Margin="0,16,0,0">
+              <StackPanel>
+                <TextBlock Text="今日统计" FontSize="13" FontWeight="Bold" Foreground="#2A241E"/>
+                <UniformGrid Columns="4" Margin="0,9,0,10">
+                  <Border BorderThickness="1" BorderBrush="#ECE6DB" CornerRadius="12" Background="#FDFBF8" Padding="4,8" Margin="0,0,4,0">
+                    <StackPanel>
+                      <TextBlock x:Name="SnDone" Text="0" FontSize="19" FontWeight="Bold" Foreground="#2A241E" HorizontalAlignment="Center"/>
+                      <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,3,0,0">
+                        <Ellipse Width="7" Height="7" Fill="#2FA84F" VerticalAlignment="Center"/>
+                        <TextBlock Text="完成" FontSize="10.5" Foreground="#8A8178" Margin="4,0,0,0"/>
+                      </StackPanel>
+                    </StackPanel>
+                  </Border>
+                  <Border BorderThickness="1" BorderBrush="#ECE6DB" CornerRadius="12" Background="#FDFBF8" Padding="4,8" Margin="0,0,4,0">
+                    <StackPanel>
+                      <TextBlock x:Name="SnErr" Text="0" FontSize="19" FontWeight="Bold" Foreground="#2A241E" HorizontalAlignment="Center"/>
+                      <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,3,0,0">
+                        <Ellipse Width="7" Height="7" Fill="#D64545" VerticalAlignment="Center"/>
+                        <TextBlock Text="报错" FontSize="10.5" Foreground="#8A8178" Margin="4,0,0,0"/>
+                      </StackPanel>
+                    </StackPanel>
+                  </Border>
+                  <Border BorderThickness="1" BorderBrush="#ECE6DB" CornerRadius="12" Background="#FDFBF8" Padding="4,8" Margin="0,0,4,0">
+                    <StackPanel>
+                      <TextBlock x:Name="SnAuth" Text="0" FontSize="19" FontWeight="Bold" Foreground="#2A241E" HorizontalAlignment="Center"/>
+                      <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,3,0,0">
+                        <Ellipse Width="7" Height="7" Fill="#2B7FD4" VerticalAlignment="Center"/>
+                        <TextBlock Text="授权" FontSize="10.5" Foreground="#8A8178" Margin="4,0,0,0"/>
+                      </StackPanel>
+                    </StackPanel>
+                  </Border>
+                  <Border BorderThickness="1" BorderBrush="#ECE6DB" CornerRadius="12" Background="#FDFBF8" Padding="4,8">
+                    <StackPanel>
+                      <TextBlock x:Name="SnWait" Text="0" FontSize="19" FontWeight="Bold" Foreground="#2A241E" HorizontalAlignment="Center"/>
+                      <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,3,0,0">
+                        <Ellipse Width="7" Height="7" Fill="#E8A24A" VerticalAlignment="Center"/>
+                        <TextBlock Text="等待" FontSize="10.5" Foreground="#8A8178" Margin="4,0,0,0"/>
+                      </StackPanel>
+                    </StackPanel>
+                  </Border>
+                </UniformGrid>
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                  <TextBlock Text="近 7 日事件量" FontSize="12" FontWeight="Bold" Foreground="#2A241E"/>
+                  <TextBlock Text="含静音/暂停期间" FontSize="10.5" Foreground="#8A8178" Margin="8,1,0,0"/>
+                </StackPanel>
+                <Canvas x:Name="TrendCanvas" Width="286" Height="74" HorizontalAlignment="Left"/>
+              </StackPanel>
+            </Border>
+          </StackPanel>
+        </Grid>
+      </StackPanel>
+      <Border Background="#FDFBF8" CornerRadius="0,0,14,14" Padding="20,12" Margin="0,16,0,0" BorderThickness="0,1,0,0" BorderBrush="#ECE6DB">
+        <Grid>
+          <StackPanel Orientation="Horizontal">
+            <TextBlock x:Name="CLogBtn" Text="打开日志" FontSize="12" Foreground="#8A8178" Cursor="Hand"/>
+            <TextBlock x:Name="CQuitBtn" Text="退出灵动岛" FontSize="12" Foreground="#8A8178" Cursor="Hand" Margin="18,0,0,0"/>
+          </StackPanel>
+          <TextBlock Text="claude-island · AI问老李" FontSize="11.5" Foreground="#A89F95" HorizontalAlignment="Right"/>
+        </Grid>
+      </Border>
+    </StackPanel>
+  </Border>
+</Window>
+"@
+  $crd = New-Object System.Xml.XmlNodeReader $cxaml
+  $script:CWin = [Windows.Markup.XamlReader]::Load($crd)
+  foreach ($n in @('CTitleBar','CMin','CClose','CMasterLabel','SwMaster','SwAuto','SwSilent','VolSlider','VolVal','AlphaSlider','AlphaVal',
+                   'SegDark','SegDarkTx','SegLight','SegLightTx','SwMuteDone','SwMuteAuth','SwMuteErr','SwMuteWait','SwMuteIdle',
+                   'SnDone','SnErr','SnAuth','SnWait','TrendCanvas','CLogBtn','CQuitBtn')) {
+    $script:CW[$n] = $script:CWin.FindName($n)
+  }
+  # 标题栏:拖动 / 最小化 / 关闭
+  $script:CW.CTitleBar.Add_MouseLeftButtonDown({ try { $script:CWin.DragMove() } catch {} })
+  $script:CW.CMin.Add_MouseLeftButtonUp({ $script:CWin.WindowState = 'Minimized' })
+  $script:CW.CClose.Add_MouseLeftButtonUp({ $script:CWin.Close() })
+  $script:CWin.Add_Closed({ $script:CWin = $null; $script:CW = @{} })
+  # 总开关 = 暂停弹窗(daemon 保活)
+  $script:CW.SwMaster.Add_MouseLeftButtonUp({ $script:Config.paused = -not $script:Config.paused; Save-Config; Sync-Master })
+  # 开机自启
+  $script:CW.SwAuto.Add_MouseLeftButtonUp({ $on = -not (Test-AutoStart); Set-AutoStart $on; Sync-Switch $script:CW.SwAuto (Test-AutoStart) })
+  # 静默
+  $script:CW.SwSilent.Add_MouseLeftButtonUp({ $script:Config.silent = -not $script:Config.silent; Save-Config; Sync-Switch $script:CW.SwSilent $script:Config.silent })
+  # 音量 / 不透明度
+  $script:CW.VolSlider.Add_ValueChanged({
+    if ($script:CWSyncing) { return }
+    $v = [int]$script:CW.VolSlider.Value
+    $script:CW.VolVal.Text = "$v%"; $script:Config.volume = $v / 100.0; Save-Config
+  })
+  $script:CW.AlphaSlider.Add_ValueChanged({
+    if ($script:CWSyncing) { return }
+    $v = [int]$script:CW.AlphaSlider.Value
+    $script:CW.AlphaVal.Text = "$v%"; $script:Config.opacity = $v / 100.0; Save-Config; Apply-Style
+  })
+  # 主题
+  $script:CW.SegDark.Add_MouseLeftButtonUp({ $script:Config.theme = 'dark'; Save-Config; Apply-Style; Sync-Seg })
+  $script:CW.SegLight.Add_MouseLeftButtonUp({ $script:Config.theme = 'light'; Save-Config; Apply-Style; Sync-Seg })
+  # 按状态静音
+  $script:CW.SwMuteDone.Add_MouseLeftButtonUp({ Toggle-Mute 'done' $script:CW.SwMuteDone })
+  $script:CW.SwMuteAuth.Add_MouseLeftButtonUp({ Toggle-Mute 'authorize' $script:CW.SwMuteAuth })
+  $script:CW.SwMuteErr.Add_MouseLeftButtonUp({ Toggle-Mute 'error' $script:CW.SwMuteErr })
+  $script:CW.SwMuteWait.Add_MouseLeftButtonUp({ Toggle-Mute 'waiting' $script:CW.SwMuteWait })
+  $script:CW.SwMuteIdle.Add_MouseLeftButtonUp({ Toggle-Mute 'idle' $script:CW.SwMuteIdle })
+  # 底部
+  $script:CW.CLogBtn.Add_MouseLeftButtonUp({
+    if (Test-Path $LogFile) { Start-Process notepad.exe $LogFile } else { Start-Process explorer.exe $RunDir }
+  })
+  $script:CW.CQuitBtn.Add_MouseLeftButtonUp({ $win.Dispatcher.Invoke([action]{ $win.Close() }) })
+  Sync-ConsoleUI
+  $script:CWin.Show()
+}
+
+# ---- 托盘(RenderShot 自检实例不建托盘) ----
+$tray = $null
+if (-not $RenderShot) {
+  $tray = New-Object System.Windows.Forms.NotifyIcon
+  $icoPath = Join-Path $Assets 'bear-idle.png'
+  try {
+    if (Test-Path $icoPath) {
+      $bm = New-Object System.Drawing.Bitmap $icoPath
+      $tray.Icon = [System.Drawing.Icon]::FromHandle($bm.GetHicon())
+    } else { $tray.Icon = [System.Drawing.SystemIcons]::Application }
+  } catch { $tray.Icon = [System.Drawing.SystemIcons]::Application }
+  $tray.Text = 'Claude 灵动岛'; $tray.Visible = $true
+  $menu = New-Object System.Windows.Forms.ContextMenuStrip
+  $miConsole = New-Object System.Windows.Forms.ToolStripMenuItem
+  $miConsole.Text = '设置控制台…'
+  $miConsole.Add_Click({ $win.Dispatcher.Invoke([action]{ Show-Console }) })
+  [void]$menu.Items.Add($miConsole)
+  $miSilent = New-Object System.Windows.Forms.ToolStripMenuItem
+  $miSilent.Text = '静默(只弹不响)'; $miSilent.CheckOnClick = $true; $miSilent.Checked = $script:Config.silent
+  $miSilent.Add_Click({ $script:Config.silent = $miSilent.Checked; Save-Config; Log "静默=$($miSilent.Checked)" })
+  [void]$menu.Items.Add($miSilent)
+  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+  $miQuit = New-Object System.Windows.Forms.ToolStripMenuItem
+  $miQuit.Text = '退出'; $miQuit.Add_Click({ $win.Dispatcher.Invoke([action]{ $win.Close() }) })
+  [void]$menu.Items.Add($miQuit)
+  # 托盘双击 = 打开控制台;菜单展开时刷新静默勾选(控制台改过要同步)
+  $tray.Add_MouseDoubleClick({ $win.Dispatcher.Invoke([action]{ Show-Console }) })
+  $menu.Add_Opening({ $miSilent.Checked = [bool]$script:Config.silent })
+  $tray.ContextMenuStrip = $menu
+}
 
 # ---- 关闭清理 ----
 $win.Add_Closed({
@@ -382,11 +916,33 @@ $win.Add_Closed({
   [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
 })
 
-# 启动:注册渲染回调 → 显示 → 主线程直接载入就绪小熊 + 开呼吸 + 读一次最新事件
+# 启动:注册渲染回调 → 显示 → 主线程直接载入就绪小熊 + 应用主题/不透明度 + 开呼吸 + 读一次最新事件
 $win.Add_ContentRendered({ Handle-EventsFile })
 Log "进入消息循环"
 $win.Show()
 Set-Bear 'idle'
+Apply-Style
 Start-Breathing
+
+# ---- RenderShot 自检模式:渲染 pill(折叠/展开)+ 控制台成 PNG 后退出 ----
+if ($RenderShot) {
+  New-Item -ItemType Directory -Force $RenderShot | Out-Null
+  $script:Config.silent = $true    # 自检不响铃
+  Apply-Event @{ state = 'done'; title = '任务完成'; project = 'AI问老李'; sub = ''; ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+  Set-Badge 3
+  $win.UpdateLayout()
+  Save-Shot $RootPanel (Join-Path $RenderShot 'pill-collapsed.png')
+  Toggle-Panel
+  $win.UpdateLayout()
+  Save-Shot $RootPanel (Join-Path $RenderShot 'pill-expanded.png')
+  Show-Console
+  $script:CWin.UpdateLayout()
+  Save-Shot $script:CWin.Content (Join-Path $RenderShot 'console.png')
+  $script:CWin.Close()
+  $win.Close()
+  exit 0
+}
+
 Handle-EventsFile
+if ($ShowConsole) { Show-Console }
 [System.Windows.Threading.Dispatcher]::Run()

@@ -11,7 +11,8 @@
 - **接真实事件**:通过 Claude Code hooks 自动驱动,无需盯终端。
 - **动效**:小熊常态呼吸、新事件弹跳、状态色光晕脉动。
 - **展开面板**:最近 6 条、多会话(按项目名区分)、相对时间、未读徽章、8 秒自动收起。
-- **配置**:静默(只弹不响)、音量、按状态静音;菜单栏/托盘一键切换。
+- **设置控制台(Windows)**:图形化设置窗口——总开关(暂停弹窗)、开机自启、静默、音量、岛体不透明度、暗/亮双主题、按状态静音、今日统计 + 近 7 日事件趋势。托盘右键「设置控制台…」或双击托盘图标打开,改动即时生效。
+- **配置**:静默(只弹不响)、音量、按状态静音;macOS 走菜单栏切换。
 - **开机自启**、拖动记忆位置、单实例。
 
 ## 架构
@@ -61,21 +62,25 @@ bash install.sh        # 自动 swift build + 拷资产 + 合并 hooks + launchd
 
 ## 配置
 
-`~/.claude/hooks/claude-island/config.json`(菜单栏/托盘可改,或手动编辑):
+`~/.claude/hooks/claude-island/config.json`(Windows 用设置控制台可视化改;macOS 菜单栏/手动编辑):
 
 ```json
-{ "silent": false, "volume": 0.6, "muteStates": [] }
+{ "silent": false, "volume": 0.6, "muteStates": [], "opacity": 0.94, "theme": "dark", "paused": false }
 ```
 
 - `silent`:静默,弹但不响。
 - `volume`:音量 0–1。
 - `muteStates`:完全忽略的状态,如 `["waiting"]` 就不再被「等待输入」打扰。
+- `opacity` / `theme` / `paused`(Windows):岛体不透明度 0.35–1、主题 `dark`/`light`、总开关暂停弹窗(daemon 保活只记录);macOS 端暂未实现,忽略这三个字段。
+
+统计归档在同目录 `stats.json`(每日各状态计数 + 已计数水位 `lastTs`,重启不重复计数;供控制台「今日统计/趋势」用)。
 
 ## 用法
 
 - **拖动**胶囊 = 移动位置(记忆到 `pos.json`)。
 - **单击**胶囊 = 展开/收起最近消息面板(8 秒无操作自动收起)。
-- 菜单栏(mac)/托盘(win):静默切换、打开配置、退出。
+- **Windows 托盘**:右键 = 设置控制台… / 静默切换 / 退出;双击图标 = 打开设置控制台。
+- **macOS 菜单栏**:静默切换、打开配置、退出。
 
 ## 卸载
 
@@ -106,7 +111,7 @@ claude-island/
 
 ## 开发 / 构建
 
-- **Windows**:直接改 `daemon.ps1`(PowerShell 5.1;改后需重存 UTF-8 **带 BOM**,否则中文按 GBK 读会崩)。
+- **Windows**:直接改 `daemon.ps1`(PowerShell 5.1;改后需重存 UTF-8 **带 BOM**,否则中文按 GBK 读会崩)。改完可跑离屏自检:`powershell -Sta -File daemon.ps1 -RenderShot <目录>` 会把 pill(折叠/展开)+ 设置控制台渲染成 PNG 后退出(不截桌面,无隐私风险);`-ShowConsole` 启动即开控制台。
 - **macOS**:`cd macos && swift build -c release`,产 `.build/release/ClaudeIsland`;手动跑 `./.build/release/ClaudeIsland --assets ../assets`。
 - 视觉概念稿:`docs/` 下的 HTML(baoyu-design 产)。
 
