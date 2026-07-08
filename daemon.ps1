@@ -306,13 +306,27 @@ function Save-Shot($element, $path, $scale = 1) {
   } catch { Log "Save-Shot 失败 $_" }
 }
 
-# ---- 位置:顶部居中(或读 pos.json) ----
+# ---- 位置:顶部居中(或读 pos.json;越界坐标不恢复) ----
 $win.Add_SourceInitialized({
   $wa = [System.Windows.SystemParameters]::WorkArea
+  $ok = $false
   if (Test-Path $PosFile) {
-    try { $p = Get-Content $PosFile -Raw | ConvertFrom-Json; $win.Left = [double]$p.x; $win.Top = [double]$p.y }
-    catch { $win.Left = ($wa.Width - $win.ActualWidth)/2; $win.Top = 12 }
-  } else { $win.Left = ($wa.Width - 320)/2; $win.Top = 12 }
+    try {
+      $p = Get-Content $PosFile -Raw | ConvertFrom-Json
+      $x = [double]$p.x; $y = [double]$p.y
+      # 钳制:换屏/分辨率变化/离屏坐标残留时,存的位置可能已在屏外——胶囊至少要有80px落在当前虚拟屏内才恢复
+      $vl = [System.Windows.SystemParameters]::VirtualScreenLeft
+      $vt = [System.Windows.SystemParameters]::VirtualScreenTop
+      $vw = [System.Windows.SystemParameters]::VirtualScreenWidth
+      $vh = [System.Windows.SystemParameters]::VirtualScreenHeight
+      if ($x -ge ($vl - 240) -and $x -le ($vl + $vw - 80) -and $y -ge ($vt - 10) -and $y -le ($vt + $vh - 40)) {
+        $win.Left = $x; $win.Top = $y; $ok = $true
+      } else {
+        Log "pos.json 越界(x=$x y=$y 虚拟屏=$vl,$vt ${vw}x${vh}),重置顶部居中"
+      }
+    } catch {}
+  }
+  if (-not $ok) { $win.Left = ($wa.Width - 320)/2; $win.Top = 12 }
 })
 
 # ---- 点 pill:拖动(移动了) or 展开/收起面板(纯点击);位置持久化 ----
@@ -323,6 +337,7 @@ $Pill.Add_MouseLeftButtonDown({
   if (-not $script:dragged) { Toggle-Panel }   # 没拖动 = 点击 → 切面板
 })
 $win.Add_LocationChanged({
+  if ($OffscreenMode) { return }   # 离屏渲染的-3000停靠坐标绝不入 pos.json(泄漏过:重启后岛被恢复到屏外)
   if ($script:EdgeAnimating -or $script:EdgeHidden) { return }   # 贴边滑动中不当拖动、不持久化隐藏坐标
   $script:dragged = $true
   try { @{ x = $win.Left; y = $win.Top } | ConvertTo-Json | Out-File -Encoding UTF8 $PosFile } catch {}
