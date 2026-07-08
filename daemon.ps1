@@ -213,8 +213,12 @@ function Set-AutoStart($on) {
         <Border x:Name="Sep1" Height="1" Background="#12FFFFFF"/>
         <StackPanel x:Name="MsgList" Margin="7,6"/>
         <Border x:Name="Sep2" Height="1" Background="#12FFFFFF"/>
-        <TextBlock x:Name="ReadAllBtn" Text="全部已读" Foreground="#CFC6BB" FontSize="12.5"
-                   Margin="16,11" Cursor="Hand"/>
+        <Grid Margin="16,11">
+          <TextBlock x:Name="ReadAllBtn" Text="全部已读" Foreground="#CFC6BB" FontSize="12.5"
+                     HorizontalAlignment="Left" Cursor="Hand"/>
+          <TextBlock x:Name="SettingsBtn" Text="⚙ 设置" Foreground="#8A8178" FontSize="12.5"
+                     HorizontalAlignment="Right" Cursor="Hand"/>
+        </Grid>
       </StackPanel>
     </Border>
   </StackPanel>
@@ -243,6 +247,7 @@ $PanelTitle = $win.FindName('PanelTitle')
 $UnreadWrap = $win.FindName('UnreadWrap')
 $Sep1       = $win.FindName('Sep1')
 $Sep2       = $win.FindName('Sep2')
+$SettingsBtn = $win.FindName('SettingsBtn')
 
 # ---- 主题+不透明度:实时作用于 pill/面板(状态色环/徽章/光晕语义两套主题一致) ----
 $script:BC = New-Object System.Windows.Media.BrushConverter
@@ -261,6 +266,7 @@ function Apply-Style {
     $UnreadWrap.Background = $script:BC.ConvertFromString('#12171717')
     $ClearBtn.Foreground = $Sub.Foreground
     $ReadAllBtn.Foreground = $script:BC.ConvertFromString('#5C544A')
+    $SettingsBtn.Foreground = $Sub.Foreground
     $Sep1.Background = $script:BC.ConvertFromString('#14171717'); $Sep2.Background = $Sep1.Background
     $script:RowTitleFg = '#2A241E'; $script:RowMetaFg = '#8A8178'
   } else {
@@ -275,6 +281,7 @@ function Apply-Style {
     $UnreadWrap.Background = $script:BC.ConvertFromString('#1AFFFFFF')
     $ClearBtn.Foreground = $script:BC.ConvertFromString('#8A8178')
     $ReadAllBtn.Foreground = $script:BC.ConvertFromString('#CFC6BB')
+    $SettingsBtn.Foreground = $script:BC.ConvertFromString('#8A8178')
     $Sep1.Background = $script:BC.ConvertFromString('#12FFFFFF'); $Sep2.Background = $Sep1.Background
     $script:RowTitleFg = '#F6F1EA'; $script:RowMetaFg = '#B4A99D'
   }
@@ -329,6 +336,7 @@ $ClearBtn.Add_MouseLeftButtonUp({
   $MsgList.Children.Clear(); Set-Badge 0; $PanelUnread.Text = '0 条未读'
 })
 $ReadAllBtn.Add_MouseLeftButtonUp({ Set-Badge 0; $PanelUnread.Text = '0 条未读' })
+$SettingsBtn.Add_MouseLeftButtonUp({ Show-Console })   # 面板齿轮直达控制台
 
 # ---- 播音效 ----
 $script:Player = New-Object System.Windows.Media.MediaPlayer
@@ -743,6 +751,52 @@ function Show-Console {
         Title="Claude 灵动岛 · 控制台" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         SizeToContent="Height" Width="748" WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         ShowInTaskbar="True" TextElement.FontFamily="Microsoft YaHei UI">
+  <Window.Resources>
+    <!-- 暖橙圆点滑块(对齐概念稿):左段橙轨+右段米轨+白底橙边圆拇指 -->
+    <Style x:Key="WarmSlider" TargetType="Slider">
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="Height" Value="18"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Slider">
+            <Grid>
+              <Track x:Name="PART_Track" VerticalAlignment="Center">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Command="Slider.DecreaseLarge" IsTabStop="False" Focusable="False">
+                    <RepeatButton.Template>
+                      <ControlTemplate TargetType="RepeatButton">
+                        <Border Height="4" CornerRadius="2" Background="#E26934"/>
+                      </ControlTemplate>
+                    </RepeatButton.Template>
+                  </RepeatButton>
+                </Track.DecreaseRepeatButton>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Command="Slider.IncreaseLarge" IsTabStop="False" Focusable="False">
+                    <RepeatButton.Template>
+                      <ControlTemplate TargetType="RepeatButton">
+                        <Border Height="4" CornerRadius="2" Background="#EFE9DE"/>
+                      </ControlTemplate>
+                    </RepeatButton.Template>
+                  </RepeatButton>
+                </Track.IncreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Width="16" Height="16" Focusable="False">
+                    <Thumb.Template>
+                      <ControlTemplate TargetType="Thumb">
+                        <Ellipse Fill="#FFFFFF" Stroke="#E26934" StrokeThickness="2">
+                          <Ellipse.Effect><DropShadowEffect BlurRadius="4" ShadowDepth="1" Opacity="0.2" Color="#000000"/></Ellipse.Effect>
+                        </Ellipse>
+                      </ControlTemplate>
+                    </Thumb.Template>
+                  </Thumb>
+                </Track.Thumb>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
   <Border Margin="14" CornerRadius="14" Background="#F9F6F1">
     <Border.Effect><DropShadowEffect BlurRadius="22" ShadowDepth="4" Direction="270" Opacity="0.30" Color="#000000"/></Border.Effect>
     <StackPanel>
@@ -819,7 +873,7 @@ function Show-Console {
                 <TextBlock Text="提示音量" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
                 <Grid Margin="0,7,0,0">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="46"/></Grid.ColumnDefinitions>
-                  <Slider x:Name="VolSlider" Minimum="0" Maximum="100" Value="60" VerticalAlignment="Center" IsMoveToPointEnabled="True"/>
+                  <Slider x:Name="VolSlider" Style="{StaticResource WarmSlider}" Minimum="0" Maximum="100" Value="60" VerticalAlignment="Center" IsMoveToPointEnabled="True"/>
                   <TextBlock x:Name="VolVal" Grid.Column="1" Text="60%" FontSize="12" FontWeight="Bold" Foreground="#E26934" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                 </Grid>
               </StackPanel>
@@ -828,7 +882,7 @@ function Show-Console {
                 <TextBlock Text="岛体不透明度" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
                 <Grid Margin="0,7,0,0">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="46"/></Grid.ColumnDefinitions>
-                  <Slider x:Name="AlphaSlider" Minimum="35" Maximum="100" Value="94" VerticalAlignment="Center" IsMoveToPointEnabled="True"/>
+                  <Slider x:Name="AlphaSlider" Style="{StaticResource WarmSlider}" Minimum="35" Maximum="100" Value="94" VerticalAlignment="Center" IsMoveToPointEnabled="True"/>
                   <TextBlock x:Name="AlphaVal" Grid.Column="1" Text="94%" FontSize="12" FontWeight="Bold" Foreground="#E26934" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                 </Grid>
               </StackPanel>
