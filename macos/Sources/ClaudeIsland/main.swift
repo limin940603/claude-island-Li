@@ -51,7 +51,10 @@ final class Config {
     var muteStates: [String] = []
     func load() {
         guard let data = try? Data(contentsOf: Paths.config),
-              let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+              let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            save()
+            return
+        }
         if let s = o["silent"] as? Bool { silent = s }
         if let v = (o["volume"] as? NSNumber)?.doubleValue { volume = v }
         if let m = o["muteStates"] as? [String] { muteStates = m }
@@ -107,7 +110,7 @@ func bearImage(_ state: String) -> NSImage? {
 }
 
 // 顶部左上原点的翻转视图(便于 y 从上往下手工布局)
-final class FlippedView: NSView { override var isFlipped: Bool { true } }
+class FlippedView: NSView { override var isFlipped: Bool { true } }
 
 func textWidth(_ s: String, _ font: NSFont) -> CGFloat {
     (s as NSString).size(withAttributes: [.font: font]).width
@@ -159,7 +162,7 @@ final class PillView: FlippedView {
 
     // 让所有点击都落在 PillView(子视图/文本不拦截 —— Peon-Ping 坑 #6)
     override func hitTest(_ point: NSPoint) -> NSView? {
-        return bounds.contains(convert(point, from: superview)) ? self : nil
+        return bounds.contains(point) ? self : nil
     }
 
     private func build() {
