@@ -50,6 +50,7 @@ $script:Config = @{
   silent = $false; volume = 0.6; muteStates = @(); opacity = 0.94; theme = 'dark'; paused = $false
   # 每状态音效:'none'|捆绑文件名(assets\sfx)|绝对路径(如 C:\Windows\Media\*.wav)
   sounds = @{ done = 'chime.mp3'; authorize = 'notification.mp3'; error = 'error.mp3'; waiting = 'pop.mp3' }
+  hwMonitor = $false   # 空闲30秒后 pill 轮换显示 CPU/内存,新事件立即让位
 }
 function Load-Config {
   if (Test-Path $ConfigFile) {
@@ -66,6 +67,7 @@ function Load-Config {
           $v = $c.sounds.$k; if ($v) { $script:Config.sounds[$k] = "$v" }
         }
       }
+      if ($null -ne $c.hwMonitor)  { $script:Config.hwMonitor = [bool]$c.hwMonitor }
     } catch {}
   }
 }
@@ -74,7 +76,7 @@ function Save-Config {
     $o = [pscustomobject]@{
       silent = $script:Config.silent; volume = $script:Config.volume; muteStates = @($script:Config.muteStates)
       opacity = $script:Config.opacity; theme = $script:Config.theme; paused = $script:Config.paused
-      sounds = [pscustomobject]$script:Config.sounds
+      sounds = [pscustomobject]$script:Config.sounds; hwMonitor = $script:Config.hwMonitor
     }
     [System.IO.File]::WriteAllText($ConfigFile, ($o | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding $false))
   } catch {}
@@ -496,6 +498,8 @@ function Apply-Event($e) {
   Set-Bear $state
   Pop-Bear                              # 换头像后弹一下
   if (-not $script:Config.silent) { Play-StateSound $state "$($e.sound)" }
+  $script:LastEventAt = [DateTime]::Now  # 通知优先:硬件监控让位30秒
+  $script:HwShowing = $false
   Log "应用事件 state=$state title=$($e.title) project=$($e.project)"
 }
 
@@ -529,6 +533,38 @@ $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(400)
 $timer.Add_Tick({ Handle-EventsFile })
 $timer.Start()
+
+# ---- 硬件监控:空闲30秒后 pill 显示 CPU/内存(3秒采样;新事件立即让位) ----
+# 用 CIM 性能类而非 PerformanceCounter:计数器名在中文 Windows 被本地化,CIM 类名语言无关
+$script:LastEventAt = [DateTime]::MinValue
+$script:HwShowing = $false
+function Get-HwSample {
+  try {
+    $cpu = [int](Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
+    $os = Get-CimInstance Win32_OperatingSystem
+    $mem = [int](100 - 100 * $os.FreePhysicalMemory / $os.TotalVisibleMemorySize)
+    return "CPU $cpu%  ·  内存 $mem%"
+  } catch { Log "硬件采样失败 $_"; return $null }
+}
+function Show-HwState($sample) {
+  if (-not $script:HwShowing) {
+    $script:HwShowing = $true
+    $brush = $script:BC.ConvertFromString($Colors['idle'])
+    $Ring.Stroke = $brush; $Glow.Color = $brush.Color
+    Set-Bear 'idle'
+    $Title.Text = '系统监控'
+  }
+  $Sub.Text = $sample
+}
+$hwTimer = New-Object System.Windows.Threading.DispatcherTimer
+$hwTimer.Interval = [TimeSpan]::FromSeconds(3)
+$hwTimer.Add_Tick({
+  if (-not $script:Config.hwMonitor) { return }
+  if (([DateTime]::Now - $script:LastEventAt).TotalSeconds -lt 30) { return }   # 通知刚来,让位
+  $s = Get-HwSample
+  if ($s) { Show-HwState $s }
+})
+if (-not $RenderShot) { $hwTimer.Start() }
 
 # ---- 设置控制台(按已批准概念稿 v0.2 移植;真岛就在屏上,改动即所见) ----
 $script:CWin = $null
@@ -617,6 +653,7 @@ function Sync-ConsoleUI {
     Sync-Master
     Sync-Switch $script:CW.SwAuto (Test-AutoStart)
     Sync-Switch $script:CW.SwSilent ([bool]$script:Config.silent)
+    Sync-Switch $script:CW.SwHw ([bool]$script:Config.hwMonitor)
     $script:CW.VolSlider.Value = [Math]::Round(100 * [double]$script:Config.volume)
     $script:CW.VolVal.Text = "$([int]$script:CW.VolSlider.Value)%"
     $script:CW.AlphaSlider.Value = [Math]::Round(100 * [double]$script:Config.opacity)
@@ -752,6 +789,16 @@ function Show-Console {
                       <TextBlock x:Name="SegLightTx" Text="亮色" FontSize="12" FontWeight="SemiBold" Foreground="#8A8178"/>
                     </Border>
                   </StackPanel>
+                </Border>
+              </Grid>
+              <Border Height="1" Background="#F0EAE0"/>
+              <Grid Margin="0,10,0,4">
+                <StackPanel Margin="0,0,56,0">
+                  <TextBlock Text="系统硬件监控" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
+                  <TextBlock Text="空闲 30 秒后岛上显示 CPU / 内存占用,新事件立即让位" FontSize="11" Foreground="#8A8178" Margin="0,2,0,0"/>
+                </StackPanel>
+                <Border x:Name="SwHw" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" HorizontalAlignment="Right" VerticalAlignment="Center">
+                  <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
                 </Border>
               </Grid>
             </StackPanel>
@@ -950,7 +997,7 @@ function Show-Console {
   foreach ($n in @('CTitleBar','CMin','CClose','CMasterLabel','SwMaster','SwAuto','SwSilent','VolSlider','VolVal','AlphaSlider','AlphaVal',
                    'SegDark','SegDarkTx','SegLight','SegLightTx','SwMuteDone','SwMuteAuth','SwMuteErr','SwMuteWait','SwMuteIdle',
                    'SnDone','SnErr','SnAuth','SnWait','TrendCanvas','CLogBtn','CQuitBtn',
-                   'SndDone','SndAuth','SndErr','SndWait','PlDone','PlAuth','PlErr','PlWait')) {
+                   'SndDone','SndAuth','SndErr','SndWait','PlDone','PlAuth','PlErr','PlWait','SwHw')) {
     $script:CW[$n] = $script:CWin.FindName($n)
   }
   # 标题栏:拖动 / 最小化 / 关闭
@@ -964,6 +1011,12 @@ function Show-Console {
   $script:CW.SwAuto.Add_MouseLeftButtonUp({ $on = -not (Test-AutoStart); Set-AutoStart $on; Sync-Switch $script:CW.SwAuto (Test-AutoStart) })
   # 静默
   $script:CW.SwSilent.Add_MouseLeftButtonUp({ $script:Config.silent = -not $script:Config.silent; Save-Config; Sync-Switch $script:CW.SwSilent $script:Config.silent })
+  # 系统硬件监控
+  $script:CW.SwHw.Add_MouseLeftButtonUp({
+    $script:Config.hwMonitor = -not $script:Config.hwMonitor; Save-Config
+    Sync-Switch $script:CW.SwHw $script:Config.hwMonitor
+    if (-not $script:Config.hwMonitor -and $script:HwShowing) { $script:HwShowing = $false; $Title.Text = 'AI问老李'; $Sub.Text = '就绪' }
+  })
   # 音量 / 不透明度
   $script:CW.VolSlider.Add_ValueChanged({
     if ($script:CWSyncing) { return }
@@ -1060,6 +1113,14 @@ if ($RenderShot) {
   Toggle-Panel
   $win.UpdateLayout()
   Save-Shot $RootPanel (Join-Path $RenderShot 'pill-expanded.png')
+  # 硬件监控态(真实采样一次;先收起面板)
+  Toggle-Panel
+  $hw = Get-HwSample
+  if ($hw) {
+    Show-HwState $hw
+    $win.UpdateLayout()
+    Save-Shot $RootPanel (Join-Path $RenderShot 'pill-hw.png')
+  }
   Show-Console
   $script:CWin.UpdateLayout()
   Save-Shot $script:CWin.Content (Join-Path $RenderShot 'console.png')
