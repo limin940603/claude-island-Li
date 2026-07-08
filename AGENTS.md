@@ -5,84 +5,82 @@
 ## 这是什么
 给 Claude Code 的跨平台桌面通知器(Windows + macOS)。Claude 任务完成/需授权/报错/等待时,顶部一颗暖调玻璃胶囊(问号小熊)切状态弹通知+音效;点开看多会话面板。架构见 README:`hooks → node emit.js → events.jsonl → 平台 daemon`。
 
-- Windows daemon:`daemon.ps1`(PowerShell+WPF)——**已完成、已验证、在用**。
-- macOS daemon:`macos/Sources/ClaudeIsland/main.swift`(Swift+AppKit)——**见下,需要你构建验证**。
+- Windows daemon:`daemon.ps1`(PowerShell+WPF)——**已完成、已验证、在用,是行为规格的唯一真相源**。
+- macOS daemon:`macos/Sources/ClaudeIsland/main.swift`(Swift+AppKit)——基础版已在 Mac 实机构建验证通过(2026-07-08,报告 `reports/mac-verify.md`),**当前任务=同步 Windows 新功能,见下**。
 
 ---
 
-## 🎯 macOS 构建与验证任务(给 Mac 上的 Codex)
+## 🎯 当前任务 B1 · macOS 同步 Windows 新功能(给 Mac 上的 Codex)
 
-### 背景(重要)
-`macos/` 下的 Swift 是**在 Windows 机器上盲写的,从未编译/运行过**——几乎肯定有编译错、AppKit API 签名不符、或布局/视觉问题。你在 Mac 上有完整工具链(能 `swift build`、能截图),**任务 = 让它真跑起来,修到与 Windows 版效果一致**。
+### 背景
+Mac 基础版验证合并(a522aec)之后,Windows 又落了 9 个功能提交(1f4083b→a93e5eb):设置控制台、按状态音效+试听、硬件监控、贴边隐藏、暗亮主题等。任务 = 把下列功能移植进 `macos/`,**行为规格一律以 `daemon.ps1` 为准**(各条已标行号,动手前先读对应段),两端体验一致。
 
-**你可以自由修改 `macos/` 下的任何代码**(Swift、脚本)来修 bug、达成目标。**不要改**共享的 `emit.js` / `assets/` 逻辑(除非确认是 bug),那是两端共用、Windows 上已验证的。保持与 `daemon.ps1` 的行为一致(状态、颜色、动效、面板)。
+**你可以自由修改 `macos/` 下任何代码**;**不要改**共享层 `emit.js` / `assets/`(两端共用、Windows 已验证),除非确认是 bug。
 
-### 前置
-```bash
-swift --version      # 需 Xcode 或 CLT;没有则 xcode-select --install
-node --version       # 需 Node.js
+### 共享契约(先读,格式两端必须一致)
+
+`config.json` 完整 schema(daemon.ps1:54-85):
+
+```json
+{
+  "silent": false, "volume": 0.6, "muteStates": [], "opacity": 0.94,
+  "theme": "dark", "paused": false,
+  "sounds": { "done": "chime.mp3", "authorize": "notification.mp3", "error": "error.mp3", "waiting": "pop.mp3" },
+  "hwMonitor": false, "edgeHide": false
+}
 ```
 
-### 步骤 1 · 构建(修所有编译错)
+- `sounds` 每键三态:`"none"`(该状态不响)/ `assets/sfx` 内置文件名 / 绝对路径(用户自选系统音,Mac 用 `/System/Library/Sounds/*.aiff`)。
+- `opacity` 读入钳制 0.35–1.0;`theme` 只认 `dark|light`,非法值忽略。
+- `stats.json`(daemon.ps1:93-135):`{ lastTs, days: { "yyyy-MM-dd": {done,error,authorize,waiting} } }`。`lastTs` 是已计数水位——daemon 重启会重读整个事件环形缓冲,**只有 `ts > lastTs` 的事件才计数**(防重复);只保留最近 14 天。Mac 若尚无统计,照此格式实现。
+
+### 功能清单(按优先级做)
+
+**P0 · 设置控制台**(daemon.ps1:639-1200 Show-Console;视觉对标 `docs/控制台概念稿v0.3.html`,浏览器打开看目标样)
+- 入口两处:菜单栏菜单加「设置…」+ 展开面板右上角齿轮 ⚙。
+- 卡片与控件:
+  1. 常规:开机自启(launchctl load/unload 该 plist)/ 静默 / 音量滑块 0-100% / 不透明度滑块 35-100%(**拖动实时应用到胶囊**)/ 暗·亮主题分段切换(实时应用)。
+  2. 按状态静音:done/authorize/error/waiting 四个开关 ↔ `muteStates` 数组(整条不弹,注意与 silent「只弹不响」语义不同,别合并)。
+  3. 提示音效:四状态各一个下拉(无 + 内置 4 首 + 系统音精选)+ ▶ 试听按钮(试听走与真实播放同一条解析逻辑,选 none 试听即静音)。
+  4. 统计:今日各状态计数 + 近 7 日总量趋势柱(数据源 stats.json,daemon.ps1:673-745)。
+  5. 硬件监控、贴边隐藏两个开关。
+- **所有改动即时写 config.json 且即时生效**,不要求重启。
+
+**P1 · 硬件监控 hwMonitor**(daemon.ps1:556-584)
+- 3 秒采样;距上次通知事件 <30 秒时让位不显示(新事件到 → 立即恢复通知显示)。
+- 显示态:idle 灰环 + 灰熊,标题「系统监控」,副题 `CPU x%  ·  内存 y%`。
+- Mac 采样用原生 API(`host_processor_info` / `host_statistics64`),**别 shell 出去跑 top**(功耗+延迟)。
+
+**P1 · 贴边隐藏 edgeHide**(daemon.ps1:586-637)
+- 空闲 30 秒(无事件、鼠标不在岛上、面板收起、且岛贴顶 Top≤60)→ 约 0.3s 指数缓动滑入屏幕顶边,只露 ~6px 细条。
+- 细条上**悬停满 0.4 秒**才唤出(意图判定,防鼠标扫过标签栏误触);新事件 → 立即唤出;开关关掉时若处于隐藏态自动弹回。
+- Mac 注意:顶部有系统菜单栏,细条应露在菜单栏下沿;若窗口 level/遮挡处理不顺,可退化为「淡出+缩成小圆点停靠」,行为语义(30s 缩/悬停唤/事件唤)不变。
+
+**P2 · 视觉细节**
+- 滑块:暖橙轨道 + 白底橙描边圆钮(概念稿 v0.3 样式)。
+- 胶囊阴影:柔和大半径低透明度(参考 daemon.ps1 Apply-Style)。
+
+**不移植(Windows 专属,勿动)**:`-RenderShot`/`-RenderClip` 离屏导出(内容生产工具);开始菜单快捷方式(Mac 有 launchd + 菜单栏,无对应物)。
+
+### 已知坑(Windows 踩过,Mac 对应自查)
+1. **可拖容器吞点击**:Windows 上标题栏 DragMove 吞掉 MouseUp,按钮全失灵,改按下阶段处理才好——Mac 控制台窗口里所有按钮/开关必须逐个点验,警惕 hitTest/mouseDown 链被拖动逻辑截胡。
+2. **统计防重复**:先读 lastTs 再比对,重启不重复计数——喂同一批事件重启两次,数字必须一样。
+3. 试听与真实播放共用一条音源解析,别写两套。
+
+### 测试与验收
+喂事件用仓库根的 `test-emit.js` 或(见 git 历史里旧版 AGENTS.md 的逐条 echo 命令):
+
 ```bash
-cd macos
-swift build -c release
+node ../test-emit.js   # 或逐条 echo '{"hook_event_name":"Stop",...}' | node ../emit.js
 ```
-逐个修编译错,保持行为语义不变。产物:`macos/.build/release/ClaudeIsland`。
 
-### 步骤 2 · 首次运行 + 截图
-```bash
-# 资产用仓库里的 assets(install 前手动指定)
-./.build/release/ClaudeIsland --assets "$(cd ../assets && pwd)" &
-```
-预期:屏幕**顶部中央**出现一颗暖黑毛玻璃圆角胶囊,左侧圆形小熊(灰·就绪态)在**轻微呼吸**,描边环带光晕。**截图**核对。
-
-### 步骤 3 · 喂各状态测试(每条间隔 >0.5s)
-```bash
-E=../emit.js
-echo '{"hook_event_name":"Stop","cwd":"/Users/x/AI问老李","session_id":"t"}' | node $E ; sleep 1
-echo '{"hook_event_name":"Notification","notification_type":"permission_prompt","cwd":"/x/demo","tool_name":"Bash","session_id":"t"}' | node $E ; sleep 1
-echo '{"hook_event_name":"PostToolUseFailure","cwd":"/x/个人网站","tool_name":"Bash","session_id":"t"}' | node $E ; sleep 1
-echo '{"hook_event_name":"Notification","notification_type":"idle_prompt","cwd":"/x/myapp","session_id":"t"}' | node $E ; sleep 1
-echo '{"hook_event_name":"SubagentStop","cwd":"/x/AI问老李","session_id":"t"}' | node $E
-```
-预期每条:胶囊**边框环变色**(绿/蓝/红/琥珀/绿)+ **换对应表情小熊** + **弹跳一下** + **响音效** + 徽章计数。截图核对。
-
-### 步骤 4 · 交互
-- **单击**胶囊 → 向下展开面板,列最近 6 条(色条+圆熊+标题+`项目 · 相对时间`),多会话不同项目名;再点或等 8 秒收起。
-- **拖动**胶囊 → 移动,位置存 `~/.claude/hooks/claude-island/pos.json`。
-- **菜单栏**图标 → 菜单:静默(勾选,勾上后喂事件只弹不响)/ 打开配置文件 / 退出。
-
-### 步骤 5 · 安装 + 真事件
-```bash
-bash install.sh        # 构建+拷资产+合并 settings.json hooks(先备份)+ launchd 自启
-```
-然后在 Claude Code 里打开一次 `/hooks`(或重启 Claude)激活。跑一个真任务 → Stop 事件 → 胶囊绿+chime = 通了。重启 Mac 验证 launchd 自启。
-
-### 验收标准(与 Windows 版对齐)
-- [ ] `swift build` 通过、无警告阻塞
-- [ ] 5 状态:颜色 done绿`#2FA84F`/authorize蓝`#2B7FD4`/error红`#D64545`/waiting琥珀`#E8A24A`/idle灰`#A89F95`,各态换对应小熊
-- [ ] 毛玻璃胶囊 + 圆形小熊 + 状态色**描边环 + 光晕**(不是纯边框)
-- [ ] 呼吸(常态)+ 弹跳(新事件,从**中心**缩放)+ 光晕脉动
-- [ ] 展开面板:多会话、相对时间、8 秒自动收起、清空/全部已读
-- [ ] 音效随状态;config `silent`/`volume`/`muteStates` 生效;菜单栏静默勾选可切
-- [ ] 拖动记忆位置;单实例;install/uninstall 正常;launchd 自启
-- [ ] 视觉尽量对齐概念稿 `docs/灵动岛概念稿.html`(浏览器打开看目标样)
-
-### ⚠ 重点排查区(盲写高风险,优先验证/大概率要修)
-1. **NSVisualEffectView 毛玻璃**:material `.hudWindow` + `.behindWindow` + 窗口 `isOpaque=false`/`backgroundColor=.clear`/`hasShadow=true` 是否真出毛玻璃圆角+投影;不行就换 material 或退化为半透纯色层。
-2. **hitTest 覆写**(PillView.hitTest 返回 self):是否让**拖动和单击都正常**、且子视图(文本)不拦截。这是点击/拖动能不能用的关键。
-3. **CASpringAnimation 参数**:`damping/stiffness/initialVelocity/mass/settlingDuration` API 是否可用;弹跳是否自然。
-4. **弹跳锚点**:pop 挂在 `avatarGroup`(手工 CALayer,anchorPoint 0.5)应从中心缩放;若从角落缩放,查 anchorPoint/position。
-5. **layer 时机**:`avatarHost.wantsLayer=true` 后才 `.layer?.addSublayer`(已这样写,确认 layer 非 nil)。
-6. **FlippedView + CALayer 坐标**:`isFlipped` 只翻转子 NSView 布局,**不翻转子 CALayer**。头像/面板里的 CALayer 都是**填满宿主 bounds 或居中对称**的,理论上不受影响;但请截图确认小熊没上下颠倒、面板行没错位。
-7. **Retina 清晰度**:`contentsScale = backingScaleFactor`(已设),确认小熊不糊。
-8. **窗口随内容变宽**:apply 里 `setContentSize` + `invalidateShadow`;确认胶囊宽度随标题变化、投影跟着更新、不跳位。
-9. **NSSound 音量**:`s.volume` 是 Float(已转);确认能响、音量受 config 控。
-10. **launchd**:plist 占位替换(`__BIN__/__ASSETS__/__LOG__`)、`launchctl load` 是否成功;`--assets` 传的是运行时目录 `~/.claude/hooks/claude-island/assets`(install.sh 已拷)。
-
-### 报告
-把「修了哪些编译错 / 改了什么 / 截图 / 仍存问题 / 与 Windows 版差异」写成执行报告(可放 `reports/` 或直接回给 Jevin)。目标是两端体验一致,之后开源。
+- [ ] `swift build -c release` 通过
+- [ ] 控制台每项改动即写 config.json 且立即生效(逐项截图)
+- [ ] 四状态音效可换、可试听;muteStates 与 silent 行为区分正确
+- [ ] hwMonitor 开:空闲 30s 显示 CPU/内存,喂事件立即让位
+- [ ] edgeHide 开:30s 缩回 → 悬停 0.4s 唤出 → 事件唤出 → 关掉开关自动弹回(录屏或日志为证)
+- [ ] stats.json 与 Windows 同格式,重启不重复计数
+- [ ] 执行报告写 `reports/mac-sync-b1.md`:改了什么 / 截图 / 仍存差异 / 遗留风险
 
 ---
 
