@@ -4,6 +4,19 @@
 
 > 出品:**AI问老李** · 一个讲清楚 AI 怎么真用起来的 IP。
 
+<p align="center">
+  <img src="docs/img/pill-dark.png" height="110" alt="暗色胶囊·任务完成"/>
+  &nbsp;&nbsp;
+  <img src="docs/img/pill-hw.png" height="110" alt="亮色胶囊·硬件监控态"/>
+</p>
+<p align="center">
+  <img src="docs/img/panel-light.png" height="380" alt="亮色主题·展开面板"/>
+  &nbsp;&nbsp;
+  <img src="docs/img/console.png" height="380" alt="设置控制台"/>
+</p>
+
+<sub>以上均为 daemon 内置 `-RenderShot` 离屏自渲染图,非桌面截屏。</sub>
+
 ## 特性
 
 - **5 状态**:任务完成(绿)/ 需要授权(蓝)/ 命令报错(红)/ 等待输入(琥珀)/ 就绪(灰),每态一张对应表情的圆形小熊。
@@ -116,6 +129,22 @@ claude-island/
   docs/                         设计概念稿等
   AGENTS.md                     给 AI agent(Codex 等)的构建/验证入口
 ```
+
+## 设计稿(HTML 概念稿 · 全程 AI 协作原创)
+
+本项目走「**设计先行**」流程:先出可交互 HTML 概念稿评审,批准后再移植原生实现(WPF / AppKit)。三份稿都在 `docs/`,浏览器直接打开,开关滑块可以点着玩:
+
+| 稿件 | 说明 |
+|---|---|
+| [灵动岛概念稿](docs/灵动岛概念稿.html) | pill 本体:5 状态、呼吸/弹跳动效、展开面板视觉定稿 |
+| [控制台概念稿 v0.2](docs/控制台概念稿.html) | 设置控制台批准时快照 |
+| [控制台概念稿 v0.3](docs/控制台概念稿v0.3.html) | 上线实物对齐稿(+硬件监控 / 贴边隐藏 / 每状态音效卡) |
+
+<p align="center">
+  <img src="docs/img/concept-island.png" width="46%" alt="灵动岛概念稿"/>
+  &nbsp;
+  <img src="docs/img/concept-console.png" width="46%" alt="控制台概念稿 v0.3"/>
+</p>
 
 ## 开发 / 构建
 
