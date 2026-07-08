@@ -11,7 +11,7 @@
 - **接真实事件**:通过 Claude Code hooks 自动驱动,无需盯终端。
 - **动效**:小熊常态呼吸、新事件弹跳、状态色光晕脉动。
 - **展开面板**:最近 6 条、多会话(按项目名区分)、相对时间、未读徽章、8 秒自动收起。
-- **设置控制台(Windows)**:图形化设置窗口——总开关(暂停弹窗)、开机自启、静默、音量、岛体不透明度、暗/亮双主题、按状态静音、今日统计 + 近 7 日事件趋势。托盘右键「设置控制台…」或双击托盘图标打开,改动即时生效。
+- **设置控制台(Windows)**:图形化设置窗口——总开关(暂停弹窗)、开机自启、静默、音量、岛体不透明度、暗/亮双主题、按状态静音、**每状态可换提示音(自带 4 个 + 系统 `C:\Windows\Media` 精选,带 ▶ 试听)**、今日统计 + 近 7 日事件趋势。托盘右键「设置控制台…」或双击托盘图标打开,改动即时生效。
 - **配置**:静默(只弹不响)、音量、按状态静音;macOS 走菜单栏切换。
 - **开机自启**、拖动记忆位置、单实例。
 
@@ -65,13 +65,19 @@ bash install.sh        # 自动 swift build + 拷资产 + 合并 hooks + launchd
 `~/.claude/hooks/claude-island/config.json`(Windows 用设置控制台可视化改;macOS 菜单栏/手动编辑):
 
 ```json
-{ "silent": false, "volume": 0.6, "muteStates": [], "opacity": 0.94, "theme": "dark", "paused": false }
+{
+  "silent": false, "volume": 0.6, "muteStates": [],
+  "opacity": 0.94, "theme": "dark", "paused": false,
+  "sounds": { "done": "chime.mp3", "authorize": "notification.mp3", "error": "error.mp3", "waiting": "pop.mp3" }
+}
 ```
 
 - `silent`:静默,弹但不响。
 - `volume`:音量 0–1。
 - `muteStates`:完全忽略的状态,如 `["waiting"]` 就不再被「等待输入」打扰。
-- `opacity` / `theme` / `paused`(Windows):岛体不透明度 0.35–1、主题 `dark`/`light`、总开关暂停弹窗(daemon 保活只记录);macOS 端暂未实现,忽略这三个字段。
+- `opacity` / `theme` / `paused`(Windows):岛体不透明度 0.35–1、主题 `dark`/`light`、总开关暂停弹窗(daemon 保活只记录)。
+- `sounds`(Windows):每状态提示音,值 = `none`(不响)/ 捆绑文件名(`assets/sfx/`)/ 绝对路径(如系统 `C:\Windows\Media\tada.wav`,运行时引用不拷贝)。
+- 以上 Windows 新增字段 macOS 端暂未实现,忽略即可。
 
 统计归档在同目录 `stats.json`(每日各状态计数 + 已计数水位 `lastTs`,重启不重复计数;供控制台「今日统计/趋势」用)。
 
