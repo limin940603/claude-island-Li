@@ -101,6 +101,7 @@ bash install.sh        # 自动 swift build + 拷资产 + 合并 hooks + launchd
 - **拖动**胶囊 = 移动位置(记忆到 `pos.json`)。
 - **单击**胶囊 = 展开/收起最近消息面板(8 秒无操作自动收起)。
 - **Windows 托盘**:右键 = 设置控制台… / 静默切换 / 退出;双击图标 = 打开设置控制台。
+- **手动启动(Windows)**:不开自启时,按 Win 键搜「Claude 灵动岛」(install.ps1 装的开始菜单入口),或直接跑 `powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File daemon.ps1`。单实例锁保证重复启动无副作用(第二个实例自动退出)。
 - **macOS 菜单栏**:静默切换、打开配置、退出。
 
 ## 卸载

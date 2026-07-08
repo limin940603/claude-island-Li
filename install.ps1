@@ -59,6 +59,31 @@ Write-Output "settings.json 写回并校验通过"
 $ev = Join-Path $run 'events.jsonl'
 if (-not (Test-Path $ev)) { New-Item -ItemType File -Force $ev | Out-Null }
 
+# ---- 开始菜单快捷方式(手动启动入口,与自启独立;Win 键搜 Claude 即可启动) ----
+$icoPath = Join-Path $isl 'assets\bear.ico'
+if (-not (Test-Path $icoPath)) {
+  try {
+    Add-Type -AssemblyName System.Drawing
+    $srcBmp = New-Object System.Drawing.Bitmap (Join-Path $isl 'assets\bear-idle.png')
+    $bm64 = New-Object System.Drawing.Bitmap $srcBmp, 64, 64
+    $icon = [System.Drawing.Icon]::FromHandle($bm64.GetHicon())
+    $fs = [System.IO.File]::OpenWrite($icoPath); $icon.Save($fs); $fs.Close()
+    $srcBmp.Dispose(); $bm64.Dispose()
+  } catch { Write-Output "bear.ico 生成失败(不影响功能): $_" }
+}
+$menuLnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Claude 灵动岛.lnk'
+$psExeM = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$shM = New-Object -ComObject WScript.Shell
+$mlnk = $shM.CreateShortcut($menuLnk)
+$mlnk.TargetPath = $psExeM
+$mlnk.Arguments  = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File `"$daemon`""
+$mlnk.WorkingDirectory = $isl
+$mlnk.WindowStyle = 7
+if (Test-Path $icoPath) { $mlnk.IconLocation = "$icoPath,0" }
+$mlnk.Description = 'Claude 灵动岛通知器'
+$mlnk.Save()
+Write-Output "开始菜单入口已装 -> $menuLnk"
+
 # ---- 开机自启(启动目录快捷方式) ----
 if (-not $NoAutostart) {
   $startup = [Environment]::GetFolderPath('Startup')

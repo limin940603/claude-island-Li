@@ -37,4 +37,8 @@ if (Test-Path $settings) {
 $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'ClaudeIsland.lnk'
 if (Test-Path $lnk) { Remove-Item $lnk -Force; Write-Output "已移除开机自启" }
 
+# ---- 移除开始菜单入口 ----
+$menuLnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Claude 灵动岛.lnk'
+if (Test-Path $menuLnk) { Remove-Item $menuLnk -Force; Write-Output "已移除开始菜单入口" }
+
 Write-Output '灵动岛已卸载(源码与资产保留)。'
