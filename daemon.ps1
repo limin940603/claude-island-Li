@@ -6,11 +6,15 @@
 param(
   [switch]$DebugLog,
   [string]$RenderShot,   # 自检:把 pill/面板/控制台离屏渲染成 PNG 到该目录后退出(不截桌面,隐私安全)
+  [string]$RenderClip,   # 素材导出:真引擎逐帧渲染演示动画(pill 5态/面板/监控 + 控制台操作)成透明底 PNG 序列后退出
   [switch]$ShowConsole   # 调试:启动即打开设置控制台
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
+
+# 离屏模式(RenderShot/RenderClip):不抢锁、不建托盘、不起轮询,渲染完即退,绝不影响在跑的真 daemon
+$OffscreenMode = [bool]($RenderShot -or $RenderClip)
 
 # ---- 路径 ----
 $Root      = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -24,8 +28,8 @@ New-Item -ItemType Directory -Force $RunDir | Out-Null
 
 function Log($m) { if ($DebugLog) { "$(Get-Date -Format 'HH:mm:ss.fff') $m" | Out-File -Append -Encoding UTF8 $LogFile } }
 
-# ---- 单实例锁(RenderShot 自检实例不抢锁不写 pid) ----
-if (-not $RenderShot) {
+# ---- 单实例锁(离屏实例不抢锁不写 pid) ----
+if (-not $OffscreenMode) {
   if (Test-Path $PidFile) {
     $old = Get-Content $PidFile -ErrorAction SilentlyContinue
     if ($old -and (Get-Process -Id $old -ErrorAction SilentlyContinue)) { Log "已有实例 $old,退出"; exit 0 }
@@ -287,13 +291,14 @@ function Apply-Style {
   }
 }
 
-# ---- 离屏渲染自检:把控件渲染成 PNG(不截桌面,隐私安全) ----
-function Save-Shot($element, $path) {
+# ---- 离屏渲染自检:把控件渲染成 PNG(不截桌面,隐私安全;scale>1 出高清素材) ----
+function Save-Shot($element, $path, $scale = 1) {
   try {
     $element.UpdateLayout()
     $w = [int][Math]::Ceiling($element.ActualWidth); $h = [int][Math]::Ceiling($element.ActualHeight)
     if ($w -le 0 -or $h -le 0) { Log "Save-Shot 尺寸为0: $path"; return }
-    $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($w, $h, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $pw = [int]($w * $scale); $ph = [int]($h * $scale); $dpi = 96.0 * $scale
+    $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($pw, $ph, $dpi, $dpi, [System.Windows.Media.PixelFormats]::Pbgra32)
     $rtb.Render($element)
     $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
     $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($rtb))
@@ -544,7 +549,7 @@ function Handle-EventsFile {
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(400)
 $timer.Add_Tick({ Handle-EventsFile })
-$timer.Start()
+if (-not $OffscreenMode) { $timer.Start() }
 
 # ---- 硬件监控:空闲30秒后 pill 显示 CPU/内存(3秒采样;新事件立即让位) ----
 # 用 CIM 性能类而非 PerformanceCounter:计数器名在中文 Windows 被本地化,CIM 类名语言无关
@@ -576,7 +581,7 @@ $hwTimer.Add_Tick({
   $s = Get-HwSample
   if ($s) { Show-HwState $s }
 })
-if (-not $RenderShot) { $hwTimer.Start() }
+if (-not $OffscreenMode) { $hwTimer.Start() }
 
 # ---- 贴边隐藏:空闲30秒缩进屏幕顶边只留细条;悬停/新事件唤出(触发即弹出) ----
 $script:EdgeHidden = $false
@@ -629,7 +634,7 @@ $script:EdgeTimer.Add_Tick({
   if ($win.Top -gt 60) { return }   # 岛不贴顶边(被拖到屏中间用)不吸附
   if (([DateTime]::Now - $script:LastWakeAt).TotalSeconds -ge 30) { Hide-Island }
 })
-if (-not $RenderShot) { $script:EdgeTimer.Start() }
+if (-not $OffscreenMode) { $script:EdgeTimer.Start() }
 
 # ---- 设置控制台(按已批准概念稿 v0.2 移植;真岛就在屏上,改动即所见) ----
 $script:CWin = $null
@@ -1183,9 +1188,9 @@ function Show-Console {
   $script:CWin.Show()
 }
 
-# ---- 托盘(RenderShot 自检实例不建托盘) ----
+# ---- 托盘(离屏实例不建托盘) ----
 $tray = $null
-if (-not $RenderShot) {
+if (-not $OffscreenMode) {
   $tray = New-Object System.Windows.Forms.NotifyIcon
   $icoPath = Join-Path $Assets 'bear-idle.png'
   try {
@@ -1254,6 +1259,93 @@ if ($RenderShot) {
   Save-Shot $script:CWin.Content (Join-Path $RenderShot 'console.png')
   $script:CWin.Close()
   $win.Close()
+  exit 0
+}
+
+# ---- RenderClip 素材导出模式:真引擎逐帧渲染演示动画(20fps,2x 透明底 PNG 序列) ----
+# 纪律:全程只读真配置不落盘(绝不 Save-Config);演示事件写在导出目录里,不碰真 events.jsonl/stats.json
+if ($RenderClip) {
+  New-Item -ItemType Directory -Force $RenderClip | Out-Null
+  New-Item -ItemType Directory -Force (Join-Path $RenderClip 'pill') | Out-Null
+  New-Item -ItemType Directory -Force (Join-Path $RenderClip 'console') | Out-Null
+  $script:Config.silent = $true            # 内存态,不落盘
+  $script:Config.theme = 'dark'; $script:Config.opacity = 0.94
+  $script:Config.muteStates = @(); $script:Config.paused = $false
+  Apply-Style
+  $win.Left = -3000                        # 挪出屏幕:离屏渲染不受位置影响,不打扰真桌面
+  # 演示事件(面板展开用;写在导出目录,不碰真缓冲)
+  $Events = Join-Path $RenderClip 'demo-events.jsonl'
+  $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $demoLines = @(
+    (@{ ts = $nowMs - 2820000; state = 'done';      title = '任务完成';   sub = ''; sound = ''; project = '个人网站'; session = 'a'; read = $true }  | ConvertTo-Json -Compress),
+    (@{ ts = $nowMs - 1500000; state = 'authorize'; title = '需要授权';   sub = ''; sound = ''; project = 'AI问老李'; session = 'b'; read = $true }  | ConvertTo-Json -Compress),
+    (@{ ts = $nowMs - 540000;  state = 'waiting';   title = '等待输入';   sub = ''; sound = ''; project = 'AI问老李'; session = 'b'; read = $false } | ConvertTo-Json -Compress),
+    (@{ ts = $nowMs - 60000;   state = 'done';      title = '子代理完成'; sub = ''; sound = ''; project = '灵动岛';   session = 'c'; read = $false } | ConvertTo-Json -Compress),
+    (@{ ts = $nowMs - 5000;    state = 'done';      title = '任务完成';   sub = ''; sound = ''; project = '灵动岛';   session = 'c'; read = $false } | ConvertTo-Json -Compress)
+  )
+  [System.IO.File]::WriteAllText($Events, ($demoLines -join "`n"), (New-Object System.Text.UTF8Encoding $false))
+
+  $script:ClipFps = 20
+  $script:ClipFrame = 0
+  $script:ClipDone = @{}
+  # 参数名带 c 前缀:防与 Apply-Event 内引用的脚本级控件变量($Title/$Sub 等)大小写不敏感撞名(坑②)
+  function Clip-Event($cState, $cTitle, $cProj, $cBadge) {
+    Apply-Event @{ state = $cState; title = $cTitle; project = $cProj; sub = ''; ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+    if ($cBadge -gt 0) { Set-Badge $cBadge }
+  }
+  $clipTimer = New-Object System.Windows.Threading.DispatcherTimer
+  $clipTimer.Interval = [TimeSpan]::FromMilliseconds(50)
+  $clipTimer.Add_Tick({
+    try {
+    $t = $script:ClipFrame / [double]$script:ClipFps
+    # —— pill 场景时间表(0-29s) ——
+    foreach ($mark in @(
+      @{ at = 2.0;  key = 'e1'; act = { Clip-Event 'done' '任务完成' 'AI问老李' 1 } },
+      @{ at = 5.0;  key = 'e2'; act = { Clip-Event 'authorize' '需要授权' 'AI问老李' 2 } },
+      @{ at = 8.0;  key = 'e3'; act = { Clip-Event 'error' '命令报错' 'AI问老李' 3 } },
+      @{ at = 11.0; key = 'e4'; act = { Clip-Event 'waiting' '等待输入' 'AI问老李' 3 } },
+      @{ at = 14.0; key = 'e5'; act = { Clip-Event 'done' '任务完成' '灵动岛' 3 } },
+      @{ at = 16.5; key = 'p1'; act = { Toggle-Panel } },
+      @{ at = 23.0; key = 'p2'; act = { Toggle-Panel } },
+      @{ at = 24.0; key = 'hw'; act = { Show-HwState ('CPU 26%  ' + [char]0x00B7 + '  内存 52%') } },
+      # —— 控制台场景(29.5-43s;全程只动视觉与内存配置,不 Save-Config) ——
+      @{ at = 29.5; key = 'c0'; act = { Show-Console; $script:CWSyncing = $true; $script:CWin.Left = -3000; $script:CWin.Top = 100 } },
+      @{ at = 31.0; key = 'c1'; act = { Sync-Switch $script:CW.SwSilent $true } },
+      @{ at = 32.5; key = 'c2'; act = { Sync-Switch $script:CW.SwSilent $false } },
+      @{ at = 38.0; key = 'c5'; act = { $script:Config.theme = 'light'; Apply-Style; Sync-Seg } },
+      @{ at = 40.5; key = 'c6'; act = { $script:Config.theme = 'dark'; Apply-Style; Sync-Seg } },
+      @{ at = 42.0; key = 'c7'; act = { Sync-Switch $script:CW.SwHw $true } }
+    )) {
+      if ($t -ge $mark.at -and -not $script:ClipDone[$mark.key]) { $script:ClipDone[$mark.key] = $true; & $mark.act }
+    }
+    # 不透明度滑块扫动(33.5-37.5s:94→60→94)
+    if ($t -ge 33.5 -and $t -lt 35.5) {
+      $v = [Math]::Max(60, 94 - [int](($t - 33.5) * 17)); $script:CW.AlphaSlider.Value = $v; $script:CW.AlphaVal.Text = "$v%"
+      $script:Config.opacity = $v / 100.0; Apply-Style
+    } elseif ($t -ge 35.5 -and $t -lt 37.5) {
+      $v = [Math]::Min(94, 60 + [int](($t - 35.5) * 17)); $script:CW.AlphaSlider.Value = $v; $script:CW.AlphaVal.Text = "$v%"
+      $script:Config.opacity = $v / 100.0; Apply-Style
+    }
+    # 出帧
+    if ($t -lt 29.0) {
+      Save-Shot $RootPanel (Join-Path (Join-Path $RenderClip 'pill') ("f{0:D5}.png" -f $script:ClipFrame)) 2
+    } elseif ($t -ge 30.0 -and $t -lt 43.0 -and $script:CWin) {
+      Save-Shot $script:CWin.Content (Join-Path (Join-Path $RenderClip 'console') ("f{0:D5}.png" -f $script:ClipFrame)) 1.5
+    }
+    $script:ClipFrame++
+    if ($t -ge 43.0) {
+      $script:ClipTimer.Stop()
+      try { if ($script:CWin) { $script:CWin.Close() } } catch {}
+      $win.Close()
+    }
+    } catch {
+      [System.IO.File]::AppendAllText((Join-Path $RenderClip 'clip-error.log'), "frame=$($script:ClipFrame) $_`r`n$($_.ScriptStackTrace)`r`n")
+      $script:ClipFrame++
+    }
+  })
+  $script:ClipTimer = $clipTimer
+  $clipTimer.Start()
+  [System.Windows.Threading.Dispatcher]::Run()
   exit 0
 }
 
