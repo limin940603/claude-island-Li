@@ -1128,9 +1128,10 @@ function Show-Console {
     $script:CW[$n] = $script:CWin.FindName($n)
   }
   # 标题栏:拖动 / 最小化 / 关闭
+  # 按钮在"按下"阶段处理并 Handled=true 拦截冒泡——否则事件冒泡到标题栏触发 DragMove,把"松开"吞掉,按钮永远点不响(坑⑥变式)
+  $script:CW.CMin.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true; $script:CWin.WindowState = 'Minimized' })
+  $script:CW.CClose.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true; $script:CWin.Close() })
   $script:CW.CTitleBar.Add_MouseLeftButtonDown({ try { $script:CWin.DragMove() } catch {} })
-  $script:CW.CMin.Add_MouseLeftButtonUp({ $script:CWin.WindowState = 'Minimized' })
-  $script:CW.CClose.Add_MouseLeftButtonUp({ $script:CWin.Close() })
   $script:CWin.Add_Closed({ $script:CWin = $null; $script:CW = @{} })
   # 总开关 = 暂停弹窗(daemon 保活)
   $script:CW.SwMaster.Add_MouseLeftButtonUp({ $script:Config.paused = -not $script:Config.paused; Save-Config; Sync-Master })
