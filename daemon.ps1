@@ -51,6 +51,7 @@ $script:Config = @{
   # 每状态音效:'none'|捆绑文件名(assets\sfx)|绝对路径(如 C:\Windows\Media\*.wav)
   sounds = @{ done = 'chime.mp3'; authorize = 'notification.mp3'; error = 'error.mp3'; waiting = 'pop.mp3' }
   hwMonitor = $false   # 空闲30秒后 pill 轮换显示 CPU/内存,新事件立即让位
+  edgeHide = $false    # 贴边隐藏:空闲30秒缩进屏幕顶边只留细条,悬停/新事件唤出
 }
 function Load-Config {
   if (Test-Path $ConfigFile) {
@@ -68,6 +69,7 @@ function Load-Config {
         }
       }
       if ($null -ne $c.hwMonitor)  { $script:Config.hwMonitor = [bool]$c.hwMonitor }
+      if ($null -ne $c.edgeHide)   { $script:Config.edgeHide = [bool]$c.edgeHide }
     } catch {}
   }
 }
@@ -76,7 +78,7 @@ function Save-Config {
     $o = [pscustomobject]@{
       silent = $script:Config.silent; volume = $script:Config.volume; muteStates = @($script:Config.muteStates)
       opacity = $script:Config.opacity; theme = $script:Config.theme; paused = $script:Config.paused
-      sounds = [pscustomobject]$script:Config.sounds; hwMonitor = $script:Config.hwMonitor
+      sounds = [pscustomobject]$script:Config.sounds; hwMonitor = $script:Config.hwMonitor; edgeHide = $script:Config.edgeHide
     }
     [System.IO.File]::WriteAllText($ConfigFile, ($o | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding $false))
   } catch {}
@@ -309,6 +311,7 @@ $Pill.Add_MouseLeftButtonDown({
   if (-not $script:dragged) { Toggle-Panel }   # 没拖动 = 点击 → 切面板
 })
 $win.Add_LocationChanged({
+  if ($script:EdgeAnimating -or $script:EdgeHidden) { return }   # 贴边滑动中不当拖动、不持久化隐藏坐标
   $script:dragged = $true
   try { @{ x = $win.Left; y = $win.Top } | ConvertTo-Json | Out-File -Encoding UTF8 $PosFile } catch {}
 })
@@ -500,6 +503,7 @@ function Apply-Event($e) {
   if (-not $script:Config.silent) { Play-StateSound $state "$($e.sound)" }
   $script:LastEventAt = [DateTime]::Now  # 通知优先:硬件监控让位30秒
   $script:HwShowing = $false
+  Wake-Island                            # 触发即弹出:贴边隐藏中来事件立即滑出
   Log "应用事件 state=$state title=$($e.title) project=$($e.project)"
 }
 
@@ -565,6 +569,51 @@ $hwTimer.Add_Tick({
   if ($s) { Show-HwState $s }
 })
 if (-not $RenderShot) { $hwTimer.Start() }
+
+# ---- 贴边隐藏:空闲30秒缩进屏幕顶边只留细条;悬停/新事件唤出(触发即弹出) ----
+$script:EdgeHidden = $false
+$script:EdgeAnimating = $false
+$script:ShownTop = $null
+$script:LastWakeAt = [DateTime]::Now
+$script:SlideTarget = 0.0
+$script:SlideTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:SlideTimer.Interval = [TimeSpan]::FromMilliseconds(15)
+$script:SlideTimer.Add_Tick({
+  $cur = $win.Top; $diff = $script:SlideTarget - $cur
+  if ([Math]::Abs($diff) -lt 1.5) { $win.Top = $script:SlideTarget; $script:SlideTimer.Stop(); $script:EdgeAnimating = $false }
+  else { $win.Top = $cur + $diff * 0.28 }   # 指数缓动,约0.3秒滑完
+})
+function Slide-To($t) { $script:SlideTarget = [double]$t; $script:EdgeAnimating = $true; $script:SlideTimer.Start() }
+function Hide-Island {
+  if ($script:EdgeHidden) { return }
+  $script:ShownTop = $win.Top
+  $script:EdgeHidden = $true
+  Slide-To (30.0 - $win.ActualHeight)   # 窗口底部24px是透明留白,留30即露出约6px pill细条
+  Log "贴边缩回"
+}
+function Wake-Island {
+  $script:LastWakeAt = [DateTime]::Now
+  if (-not $script:EdgeHidden) { return }
+  $script:EdgeHidden = $false
+  $t = 12.0; if ($null -ne $script:ShownTop) { $t = [double]$script:ShownTop }
+  Slide-To $t
+  Log "贴边唤出"
+}
+$win.Add_MouseEnter({
+  if ($script:EdgeHidden) { Wake-Island }
+  elseif ($script:Config.edgeHide) { $script:LastWakeAt = [DateTime]::Now }
+})
+$script:EdgeTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:EdgeTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:EdgeTimer.Add_Tick({
+  if (-not $script:Config.edgeHide) { if ($script:EdgeHidden) { Wake-Island }; return }   # 开关关掉时自动弹回
+  if ($script:EdgeHidden -or $script:EdgeAnimating) { return }
+  if ($win.IsMouseOver) { $script:LastWakeAt = [DateTime]::Now; return }
+  if ($Panel.Visibility -eq [System.Windows.Visibility]::Visible) { $script:LastWakeAt = [DateTime]::Now; return }
+  if ($win.Top -gt 60) { return }   # 岛不贴顶边(被拖到屏中间用)不吸附
+  if (([DateTime]::Now - $script:LastWakeAt).TotalSeconds -ge 30) { Hide-Island }
+})
+if (-not $RenderShot) { $script:EdgeTimer.Start() }
 
 # ---- 设置控制台(按已批准概念稿 v0.2 移植;真岛就在屏上,改动即所见) ----
 $script:CWin = $null
@@ -654,6 +703,7 @@ function Sync-ConsoleUI {
     Sync-Switch $script:CW.SwAuto (Test-AutoStart)
     Sync-Switch $script:CW.SwSilent ([bool]$script:Config.silent)
     Sync-Switch $script:CW.SwHw ([bool]$script:Config.hwMonitor)
+    Sync-Switch $script:CW.SwEdge ([bool]$script:Config.edgeHide)
     $script:CW.VolSlider.Value = [Math]::Round(100 * [double]$script:Config.volume)
     $script:CW.VolVal.Text = "$([int]$script:CW.VolSlider.Value)%"
     $script:CW.AlphaSlider.Value = [Math]::Round(100 * [double]$script:Config.opacity)
@@ -792,12 +842,22 @@ function Show-Console {
                 </Border>
               </Grid>
               <Border Height="1" Background="#F0EAE0"/>
-              <Grid Margin="0,10,0,4">
+              <Grid Margin="0,10,0,10">
                 <StackPanel Margin="0,0,56,0">
                   <TextBlock Text="系统硬件监控" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
                   <TextBlock Text="空闲 30 秒后岛上显示 CPU / 内存占用,新事件立即让位" FontSize="11" Foreground="#8A8178" Margin="0,2,0,0"/>
                 </StackPanel>
                 <Border x:Name="SwHw" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" HorizontalAlignment="Right" VerticalAlignment="Center">
+                  <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                </Border>
+              </Grid>
+              <Border Height="1" Background="#F0EAE0"/>
+              <Grid Margin="0,10,0,4">
+                <StackPanel Margin="0,0,56,0">
+                  <TextBlock Text="贴边隐藏" FontSize="13" FontWeight="SemiBold" Foreground="#2A241E"/>
+                  <TextBlock Text="空闲 30 秒缩进屏幕顶边只留细条;悬停或新事件弹出" FontSize="11" Foreground="#8A8178" Margin="0,2,0,0"/>
+                </StackPanel>
+                <Border x:Name="SwEdge" Width="42" Height="23" CornerRadius="12" Background="#E4DCCF" Cursor="Hand" HorizontalAlignment="Right" VerticalAlignment="Center">
                   <Ellipse Width="18" Height="18" Fill="White" HorizontalAlignment="Left" Margin="3,0,0,0"/>
                 </Border>
               </Grid>
@@ -997,7 +1057,7 @@ function Show-Console {
   foreach ($n in @('CTitleBar','CMin','CClose','CMasterLabel','SwMaster','SwAuto','SwSilent','VolSlider','VolVal','AlphaSlider','AlphaVal',
                    'SegDark','SegDarkTx','SegLight','SegLightTx','SwMuteDone','SwMuteAuth','SwMuteErr','SwMuteWait','SwMuteIdle',
                    'SnDone','SnErr','SnAuth','SnWait','TrendCanvas','CLogBtn','CQuitBtn',
-                   'SndDone','SndAuth','SndErr','SndWait','PlDone','PlAuth','PlErr','PlWait','SwHw')) {
+                   'SndDone','SndAuth','SndErr','SndWait','PlDone','PlAuth','PlErr','PlWait','SwHw','SwEdge')) {
     $script:CW[$n] = $script:CWin.FindName($n)
   }
   # 标题栏:拖动 / 最小化 / 关闭
@@ -1016,6 +1076,12 @@ function Show-Console {
     $script:Config.hwMonitor = -not $script:Config.hwMonitor; Save-Config
     Sync-Switch $script:CW.SwHw $script:Config.hwMonitor
     if (-not $script:Config.hwMonitor -and $script:HwShowing) { $script:HwShowing = $false; $Title.Text = 'AI问老李'; $Sub.Text = '就绪' }
+  })
+  # 贴边隐藏
+  $script:CW.SwEdge.Add_MouseLeftButtonUp({
+    $script:Config.edgeHide = -not $script:Config.edgeHide; Save-Config
+    Sync-Switch $script:CW.SwEdge $script:Config.edgeHide
+    $script:LastWakeAt = [DateTime]::Now   # 刚开启不立刻缩,给30秒观察期
   })
   # 音量 / 不透明度
   $script:CW.VolSlider.Add_ValueChanged({
